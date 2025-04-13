@@ -105,6 +105,7 @@ async def init_system():
 
     return cache_handler, db_pool
 
+
 async def run_pipeline() -> None:
     cache_handler, _ = await init_system()
 
@@ -124,7 +125,7 @@ async def run_pipeline() -> None:
                 "MIN_QUOTE_VOLUME": 1_000_000.0,
                 "MIN_PRICE_CHANGE": 3.0,
                 "MIN_OPEN_INTEREST": 500_000.0,
-                "MAX_SYMBOLS": 120,
+                "MAX_SYMBOLS": 200,
             },
             dynamic=False
         )

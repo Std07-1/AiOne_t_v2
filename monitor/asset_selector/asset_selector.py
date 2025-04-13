@@ -37,7 +37,7 @@ from . import config, analyzers, filters, utils
 
 from monitor.asset_selector.utils import dumps_safe   
 from monitor.indicators.volatility_analysis import analyze_volatility
-# Оновлено: імпортуємо новий швидкий фільтр замість старого basic_asset_filter
+# Оновлено: імпортуємо новий швидкий фільтр 
 from monitor.asset_selector.optimized_asset_filter import get_prefiltered_symbols
 
 logger = logging.getLogger("asset_selector")
@@ -77,7 +77,7 @@ async def _fetch_open_interest(
     )
     if isinstance(oi_cached, float):
         logger.debug(
-            f"[OPEN_INT][CACHE] {symbol} => {oi_cached} ({utils.format_open_interest(oi_cached)})"
+            f"[OPEN_INT][CACHE] {symbol} => {utils.format_open_interest(oi_cached)}"
         )
         return oi_cached
 
@@ -349,7 +349,7 @@ async def generate_analysis_report(
             f"\n   Відносна сила: {rel_str_txt}"
             f"\n   Зростання обсягу: {asset['volume_increasing']}"
             f"\n   Аномалія обсягу (Z): {z_val:.2f} ({z_txt})"
-            f"\n   Кореляція: {asset.get('correlation_with_index', 0.0):.2f}"
+            f"\n   Кореляція: {asset.get('correlation_with_index', 0.0):.4f}"
             f"\n   OpenInterest: {utils.format_open_interest(asset['open_interest'])}"
             "\n--------------------------------------------------------"
         )
@@ -475,7 +475,7 @@ async def apply_rs_and_volume_filtering(
             if not cond_vol:
                 reasons.append("vol_inc")
             a["stage2_flag"] = f"warning({','.join(reasons)})"
-            logger.debug(
+            logger.info(
                 "[stage2_warning] %s: RS=%.2f%%, vol_inc=%s, Z=%.2f — передано з попередженням.",
                 a["ticker"], 100 * a["rel_strength"], a["volume_increasing"], a["volume_anomaly"]
             )
@@ -728,6 +728,31 @@ def display_top_assets(final_assets: list) -> None:
 │  моніторингу у реальному часі.                                               │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
+
+final_assets — це список топ-активів, кожен з яких є словником із ключами:
+
+"ticker"
+
+"avg_volume", "avg_volume_str"
+
+"volatility"
+
+"structure_score"
+
+"price_change"
+
+"trend"
+
+"rel_strength" (і, відповідно, форматований рядок)
+
+"volume_increasing"
+
+"volume_anomaly"
+
+"open_interest"
+
+"correlation_with_index"
+
 """
 
               
