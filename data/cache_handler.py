@@ -45,7 +45,8 @@ class SimpleCacheHandler:
                 db=db,
                 decode_responses=True
             )
-            logger.info("Redis ініціалізовано через host/port.")
+            logger.info("Redis ініціалізовано через host/port. {redis_url}")
+            logger.info(f"Redis client type: {type(self.client)}")
         except Exception as e:
             logger.error(f"[Redis][INIT:local] Помилка: {e}")
             self.client = None
@@ -69,6 +70,8 @@ class SimpleCacheHandler:
             # Redis сам розпізнає rediss:// і активує SSL при потребі
             inst.client = Redis.from_url(redis_url, decode_responses=True)
             logger.info(f"[Redis][INIT:URI] Підключено до Redis через {parsed.scheme}://...")
+            logger.info(f"[Redis][URI] Порт Redis: {parsed.port}, Хост: {parsed.hostname}")
+
 
         except ValueError as e:
             logger.error(f"[Redis][URI] Некоректний URI: {e}")
@@ -80,6 +83,8 @@ class SimpleCacheHandler:
             logger.error(f"[Redis][INIT] Redis‑помилка: {e}")
         except Exception as e:
             logger.error(f"[Redis][INIT] Невідома помилка ініціалізації: {e}")
+        except (ConnectionError, TimeoutError) as e:
+            logger.error(f"[Redis][TIMEOUT/CONN] Підключення недоступне: {e}")
 
         return inst
     
@@ -96,6 +101,9 @@ class SimpleCacheHandler:
         """
         Запис даних у Redis зі сформованим ключем prefix:symbol:interval.
         """
+        if not self.client:
+            logger.error(f"[Redis][ERROR] [store_in_cache] Клієнт Redis не ініціалізовано — ключ='{key}'")
+            return None
         key = self._format_key(symbol, interval, prefix)
         try:
             await self.client.setex(key, ttl, data_json)
@@ -113,6 +121,9 @@ class SimpleCacheHandler:
         Отримує дані з Redis у вигляді JSON-списку → DataFrame,
         або dict (якщо зберігався інший формат).
         """
+        if not self.client:
+            logger.error(f"[Redis][ERROR] [fetch_from_cache] Клієнт Redis не ініціалізовано — ключ='{key}'")
+            return None
         key = self._format_key(symbol, interval, prefix)
         try:
             data_json = await self.client.get(key)
