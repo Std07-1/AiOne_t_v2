@@ -33,6 +33,7 @@ indicators/
 # Docker-related
 docker-compose
 Dockerfile
+*.dockerignore
 
 # Python project structure — internal
 datafetcher/__init__.py
