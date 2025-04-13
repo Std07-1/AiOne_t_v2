@@ -1,5 +1,4 @@
 # cache_handler.py
-from redis.asyncio import Redis
 import json
 import pandas as pd
 import logging
@@ -8,6 +7,8 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 import ssl
+from redis.asyncio import Redis
+from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
 logger = logging.getLogger("cache_handler")
@@ -26,32 +27,46 @@ logger.propagate = False
 
 class SimpleCacheHandler:
     """
-    Легковаговий async-клієнт Redis із підтримкою:
-    • host/port (локально)            → redis://localhost:6379/0
-    • URI (Heroku REDIS_URL, rediss)  → rediss://:pwd@host:port
+    Легковаговий async-клієнт Redis із коректною підтримкою SSL/TLS для Heroku Redis.
     """
 
     # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює клієнт Redis з URI (редис чи редісс).
-        Явно ігнорує перевірку SSL сертифіката (працює гарантовано на Heroku).
+        Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
         """
+        url_parts = urlparse(redis_url)
+        
+        # Встановлюємо SSL параметри, якщо використовуємо редіс через TLS
+        ssl_params = (
+            {'ssl_cert_reqs': ssl.CERT_NONE}
+            if url_parts.scheme == "rediss"
+            else {}
+        )
+
+        # Створюємо Redis клієнт із параметрами SSL лише для rediss
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl=True,                    # явно активуємо SSL
-            ssl_cert_reqs=ssl.CERT_NONE  # явно відключаємо перевірку сертифіката
+            **ssl_params
         )
+
         inst = cls.__new__(cls)
         inst.client = redis_client
         return inst
 
     # --------- базовий конструктор -----------------------------------------
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
-        self.client = Redis(host=host, port=port, db=db, decode_responses=True)
-
+        """
+        Створює локальний Redis клієнт без SSL.
+        """
+        self.client = Redis(
+            host=host,
+            port=port,
+            db=db,
+            decode_responses=True
+        )
 
     # --------- основні методи ----------------------------------------------
     async def store_in_cache(
