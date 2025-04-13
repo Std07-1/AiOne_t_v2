@@ -7,7 +7,7 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 import ssl
-from redis.asyncio import Redis
+from redis.asyncio import Redis, ConnectionPool
 from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
@@ -37,23 +37,24 @@ class SimpleCacheHandler:
         Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
         """
         url_parts = urlparse(redis_url)
+        use_ssl = url_parts.scheme == "rediss"
         
-        # Встановлюємо SSL параметри, якщо використовуємо редіс через TLS
-        ssl_context = None
-        if url_parts.scheme == "rediss":
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+        # Конфігурація SSL з вимкненою перевіркою сертифікатів
+        ssl_params = {
+            'ssl_cert_reqs': ssl.CERT_NONE,
+            'ssl_check_hostname': False
+        } if use_ssl else {}
 
-        # Створюємо Redis клієнт із параметрами SSL лише для rediss
-        redis_client = Redis.from_url(
+        # Створюємо пул з'єднань з правильними параметрами
+        pool = ConnectionPool.from_url(
             redis_url,
             decode_responses=True,
-            ssl_context=ssl_context  # ось тут ключова зміна!
+            ssl=use_ssl,
+            **ssl_params
         )
 
         inst = cls.__new__(cls)
-        inst.client = redis_client
+        inst.client = Redis(connection_pool=pool)
         return inst
 
     # --------- базовий конструктор -----------------------------------------
@@ -65,7 +66,8 @@ class SimpleCacheHandler:
             host=host,
             port=port,
             db=db,
-            decode_responses=True
+            decode_responses=True,
+            ssl=False
         )
 
     # --------- основні методи ----------------------------------------------
