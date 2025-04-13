@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 import ssl
 from redis.asyncio import Redis 
+from redis.exceptions import RedisError
 from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
@@ -27,42 +28,59 @@ logger.propagate = False
 
 class SimpleCacheHandler:
     """
-    Легковаговий async-клієнт Redis із коректною підтримкою SSL/TLS для Heroku Redis.
+    Легковаговий async-клієнт Redis із підтримкою:
+    • rediss:// (Heroku, автоматичне SSL)
+    • redis:// (локально, без SSL)
     """
 
     # --------- базовий конструктор -----------------------------------------
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
         """
-        Ініціалізує Redis-клієнт без SSL (локально).
+        Ініціалізація Redis без SSL (локальний режим).
         """
-        self.client = Redis(
-            host=host,
-            port=port,
-            db=db,
-            decode_responses=True
-        )
+        try:
+            self.client = Redis(
+                host=host,
+                port=port,
+                db=db,
+                decode_responses=True
+            )
+            logger.info("Redis ініціалізовано через host/port.")
+        except Exception as e:
+            logger.error(f"[Redis][INIT:local] Помилка: {e}")
+            self.client = None
 
     # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює Redis клієнт з rediss:// (Heroku) з відключеною верифікацією сертифікатів.
+        Ініціалізує Redis-клієнт з URL (Heroku REDIS_URL).
+        Враховує можливі помилки URI, SSL та версійну несумісність.
         """
-        ssl_context = None
-        if redis_url.startswith("rediss://"):
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-
-        redis_client = Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            ssl=ssl_context is not None,
-            ssl_context=ssl_context
-        )
-
         inst = cls.__new__(cls)
-        inst.client = redis_client
+        inst.client = None
+
+        try:
+            parsed = urlparse(redis_url)
+
+            if not parsed.scheme.startswith("redis"):
+                raise ValueError(f"Невірна схема URI: {parsed.scheme}")
+
+            # Redis сам розпізнає rediss:// і активує SSL при потребі
+            inst.client = Redis.from_url(redis_url, decode_responses=True)
+            logger.info(f"[Redis][INIT:URI] Підключено до Redis через {parsed.scheme}://...")
+
+        except ValueError as e:
+            logger.error(f"[Redis][URI] Некоректний URI: {e}")
+        except TypeError as e:
+            logger.error(f"[Redis][TYPE] Несумісність параметрів Redis: {e}")
+        except ConnectionError as e:
+            logger.error(f"[Redis][CONN] Помилка підключення: {e}")
+        except RedisError as e:
+            logger.error(f"[Redis][INIT] Redis‑помилка: {e}")
+        except Exception as e:
+            logger.error(f"[Redis][INIT] Невідома помилка ініціалізації: {e}")
+
         return inst
     
 
