@@ -27,7 +27,7 @@ from monitor.asset_selector.config import (
 )
 
 # Імпорт налаштувань (з файлу settings.py, що знаходиться в корені проекту)
-from .settings import settings
+from app.settings import settings
 
 # Завантаження змінних середовища (для локального запуску)
 load_dotenv()
