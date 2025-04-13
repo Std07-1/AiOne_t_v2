@@ -26,30 +26,23 @@ logger.propagate = False
 # ──────────────────────────────────────────────────────────────────
 
 class SimpleCacheHandler:
-    """
-    Оновлена реалізація з правильним SSL management для Redis 4.x+
-    """
-
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює клієнт Redis з коректною SSL конфігурацією
+        Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
         """
         url_parts = urlparse(redis_url)
-        
-        # Створюємо кастомний SSL контекст для rediss
+
         ssl_context = None
         if url_parts.scheme == "rediss":
-            ssl_context = ssl.SSLContext()
+            ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl=url_parts.scheme == "rediss",
-            ssl_cert_reqs=None,  # Використовуємо наш контекст
-            ssl_context=ssl_context
+            ssl=ssl_context
         )
 
         inst = cls.__new__(cls)
@@ -62,8 +55,7 @@ class SimpleCacheHandler:
             host=host,
             port=port,
             db=db,
-            decode_responses=True,
-            ssl=False  # Вимикаємо SSL для локальних з'єднань
+            decode_responses=True
         )
 
     # --------- основні методи ----------------------------------------------
