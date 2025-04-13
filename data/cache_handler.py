@@ -7,7 +7,8 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 import ssl
-from redis.asyncio import Redis, ConnectionPool
+from redis.asyncio import Redis
+from redis.asyncio.connection import ConnectionPool
 from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
@@ -30,33 +31,6 @@ class SimpleCacheHandler:
     Легковаговий async-клієнт Redis із коректною підтримкою SSL/TLS для Heroku Redis.
     """
 
-    # --------- фабрики ------------------------------------------------------
-    @classmethod
-    def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
-        """
-        Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
-        """
-        url_parts = urlparse(redis_url)
-        use_ssl = url_parts.scheme == "rediss"
-        
-        # Конфігурація SSL з вимкненою перевіркою сертифікатів
-        ssl_params = {
-            'ssl_cert_reqs': ssl.CERT_NONE,
-            'ssl_check_hostname': False
-        } if use_ssl else {}
-
-        # Створюємо пул з'єднань з правильними параметрами
-        pool = ConnectionPool.from_url(
-            redis_url,
-            decode_responses=True,
-            ssl=use_ssl,
-            **ssl_params
-        )
-
-        inst = cls.__new__(cls)
-        inst.client = Redis(connection_pool=pool)
-        return inst
-
     # --------- базовий конструктор -----------------------------------------
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
         """
@@ -66,9 +40,38 @@ class SimpleCacheHandler:
             host=host,
             port=port,
             db=db,
-            decode_responses=True,
-            ssl=False
+            decode_responses=True
         )
+
+    # --------- фабрики ------------------------------------------------------
+    @classmethod
+    def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
+        """
+        Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
+        """
+        url_parts = urlparse(redis_url)
+        
+        # Конфігурація SSL з вимкненою перевіркою сертифікатів
+
+        if url_parts.scheme == "rediss":
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_context = None
+
+        # Створюємо пул з'єднань з правильними параметрами
+        pool = ConnectionPool.from_url(
+            redis_url,
+            decode_responses=True,
+            ssl_context=ssl_context  # SSL-контекст тут!
+        )
+
+        inst = cls.__new__(cls)
+        inst.client = Redis(connection_pool=pool)
+        return inst
+
+
 
     # --------- основні методи ----------------------------------------------
     async def store_in_cache(
