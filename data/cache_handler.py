@@ -7,6 +7,7 @@ from typing import Optional
 import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
+import ssl
 
 # ──────────────────────────  логування  ──────────────────────────
 logger = logging.getLogger("cache_handler")
@@ -37,11 +38,10 @@ class SimpleCacheHandler:
         Створює клієнт Redis із URI (rediss:// або redis://).
         Автоматично активує SSL, якщо URI починається з rediss://.
         """
-        # без явного ssl=True, бо це вже автоматично при rediss://
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl_cert_reqs=None if redis_url.startswith("rediss://") else "required"
+            ssl_cert_reqs=ssl.CERT_NONE  # Ігноруємо перевірку сертифікатів SSL
         )
         inst = cls.__new__(cls)
         inst.client = redis_client
