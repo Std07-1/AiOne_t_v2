@@ -45,8 +45,5 @@ datafetcher/cache_handler.py
 datafetcher/websocket.py
 datafetcher/raw_data.py
 
-# Logging config
-logging_config.py
-
 # Temporary scripts / testing
 tr4.py
