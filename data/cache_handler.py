@@ -7,7 +7,7 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 import ssl
-from redis import Redis
+from redis.asyncio import Redis 
 from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
