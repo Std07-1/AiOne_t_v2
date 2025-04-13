@@ -7,8 +7,7 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 import ssl
-from redis.asyncio import Redis
-from redis.asyncio.connection import ConnectionPool
+from redis import Redis
 from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
@@ -40,27 +39,22 @@ class SimpleCacheHandler:
             host=host,
             port=port,
             db=db,
-            decode_responses=True,
-            ssl=False
+            decode_responses=True
+            # також БЕЗ ssl
         )
 
     # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Ініціалізує Redis через URI (авто-SSL).
+        Створює Redis-клієнт з підтримкою rediss:// (Heroku).
+        Redis >= 5.0 не підтримує ssl/ssl_context напряму — все обробляється всередині from_url.
         """
-        parsed = urlparse(redis_url)
-        scheme = parsed.scheme
-
-        # Redis-пул із автоматичним вибором SSL (лише для rediss://)
-        pool = ConnectionPool.from_url(
+        redis_client = Redis.from_url(
             redis_url,
-            decode_responses=True,
-            ssl=True if scheme == "rediss" else False
+            decode_responses=True
+            # БЕЗ ssl / ssl_context — все вже вбудовано в Redis.from_url
         )
-
-        redis_client = Redis(connection_pool=pool)
 
         inst = cls.__new__(cls)
         inst.client = redis_client
