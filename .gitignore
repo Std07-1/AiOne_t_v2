@@ -14,6 +14,8 @@ AiOne_t/venv_aione_t/
 # Editor / system files
 *.log
 *.txt
+!requirements.txt
+!runtime.txt
 *.yml
 .env
 keys
@@ -25,6 +27,7 @@ logs/
 symbols/
 analytics/
 indicators/
+!monitor/indicators/
 
 # Cache and intermediate data
 *.csv
