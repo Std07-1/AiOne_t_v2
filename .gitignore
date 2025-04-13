@@ -16,6 +16,7 @@ AiOne_t/venv_aione_t/
 *.txt
 !requirements.txt
 !runtime.txt
+!Procfile
 *.yml
 .env
 keys
