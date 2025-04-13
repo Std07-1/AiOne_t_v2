@@ -40,21 +40,24 @@ logger = logging.getLogger("main")
 
 def validate_settings() -> None:
     """
-    Перевірка, чи присутні всі необхідні налаштування.
-    Використовує settings з settings.py.
+    Перевіряємо або REDIS_URL, або пару host/port.
     """
     missing = []
-    if not settings.redis_host:
-        missing.append("REDIS_HOST")
-    if not settings.redis_port:
-        missing.append("REDIS_PORT")
+    if not os.getenv("REDIS_URL"):
+        if not settings.redis_host:
+            missing.append("REDIS_HOST")
+        if not settings.redis_port:
+            missing.append("REDIS_PORT")
+
     if not settings.binance_api_key:
         missing.append("BINANCE_API_KEY")
     if not settings.binance_secret_key:
         missing.append("BINANCE_SECRET_KEY")
+
     if missing:
-        raise ValueError(f"Необхідні налаштування відсутні: {', '.join(missing)}")
-    logger.info("Усі необхідні налаштування завантажено з settings.py.")
+        raise ValueError(f"Відсутні налаштування: {', '.join(missing)}")
+    logger.info("Налаштування перевірено — OK.")
+
 
 
 async def init_db():
@@ -79,22 +82,28 @@ async def init_db():
         return None
 
 
-# Оновлення функції ініціалізації
+# ────────────────────────── init_system ──────────────────────────
 async def init_system():
     validate_settings()
 
-    # Простий CacheHandler без складних механізмів
-    cache_handler = SimpleCacheHandler(
-        host=settings.redis_host,
-        port=settings.redis_port
-    )
+    # 1️⃣  Пробуємо Heroku‑стиль REDIS_URL
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        cache_handler = SimpleCacheHandler.from_url(redis_url)
+        logger.info("Підключились до Redis через URI.")
+    else:
+        # 2️⃣  Фолбек на локальні змінні
+        cache_handler = SimpleCacheHandler(
+            host=settings.redis_host,
+            port=settings.redis_port,
+        )
+        logger.info("Підключились до Redis через host/port.")
 
     db_pool = await init_db()
     if db_pool is None:
-        logger.warning("База даних не підключена. Продовжуємо у тестовому режимі.")
+        logger.warning("База даних не підключена — тестовий режим.")
 
     return cache_handler, db_pool
-
 
 async def run_pipeline() -> None:
     cache_handler, _ = await init_system()

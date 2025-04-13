@@ -8,26 +8,49 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 
+# ──────────────────────────  логування  ──────────────────────────
 logger = logging.getLogger("cache_handler")
 logger.setLevel(logging.INFO)
 
-# Налаштовуємо обробник через RichHandler для більш красивого форматування
 console = Console()
-rich_handler = RichHandler(console=console, level=logging.INFO, show_path=False)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-rich_handler.setFormatter(formatter)
+rich_handler = RichHandler(console=console, show_path=False)
+rich_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
 if not logger.handlers:
     logger.addHandler(rich_handler)
 logger.propagate = False
 
+# ──────────────────────────────────────────────────────────────────
+
 class SimpleCacheHandler:
     """
-    Клас для кешування та отримання даних через Redis.
+    Легковаговий async‑клієнт Redis із підтримкою:
+    • host/port (локально)            → redis://localhost:6379/0
+    • URI (Heroku REDIS_URL, rediss)  → rediss://:pwd@host:port
     """
 
-    def __init__(self, host='localhost', port=6379, db=0):
+    # --------- фабрики ------------------------------------------------------
+    @classmethod
+    def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
+        """
+        Створює клієнт Redis із URI (rediss:// або redis://).
+        """
+        redis_client = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            ssl=redis_url.startswith("rediss://"),
+        )
+        inst = cls.__new__(cls)        # обходимо __init__
+        inst.client = redis_client
+        return inst
+
+    # --------- базовий конструктор -----------------------------------------
+    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
         self.client = Redis(host=host, port=port, db=db, decode_responses=True)
 
+
+    # --------- основні методи ----------------------------------------------
     async def store_in_cache(
         self,
         symbol: str,
@@ -135,8 +158,7 @@ class SimpleCacheHandler:
             logger.error(f"[Redis][ERROR] get_remaining_ttl: ключ='{key}', {e}")
             return -2
 
+    # --------- утиліти ------------------------------------------------------
     @staticmethod
     def _format_key(symbol: str, interval: str, prefix: Optional[str] = None) -> str:
-        if prefix:
-            return f"{prefix}:{symbol}:{interval}"
-        return f"{symbol}:{interval}"
+        return f"{prefix}:{symbol}:{interval}" if prefix else f"{symbol}:{interval}"
