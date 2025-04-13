@@ -33,6 +33,7 @@ from tenacity import (
     wait_exponential,
     retry_if_exception,
 )
+from aiohttp import ClientResponseError
 
 logger = logging.getLogger("optimized_asset_filter")
 
@@ -88,11 +89,36 @@ def _is_retryable(exc: BaseException) -> bool:
     ),
 )
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> list | dict:
-    """HTTP GET → JSON (з повторними спробами)."""
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        # 4xx → одразу кидаємо ClientResponseError; tenacity не повторить
-        resp.raise_for_status()
-        return await resp.json()
+    """
+    Функція виконує HTTP GET запит до вказаного URL і повертає JSON.
+    Якщо виникає помилка (наприклад, HTTP 451 або інша),
+    логгує повідомлення та повертає порожній словник.
+    
+    Аргументи:
+        session: об'єкт aiohttp.ClientSession для виконання запиту.
+        url: URL-адреса запиту.
+        
+    Повертає:
+        JSON дані у вигляді списку або словника, або {} при помилці.
+    """
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Якщо статус відповіді не успішний (4xx, 5xx), кидаємо виключення
+            resp.raise_for_status()
+            # Повертаємо отриманий JSON
+            return await resp.json()
+    except ClientResponseError as e:
+        if e.status == 451:
+            # Якщо статус 451 (доступ заборонено з юридичних причин),
+            # логгуємо помилку і не повторюємо запит
+            logger.error("HTTP 451: Доступ заблоковано для URL %s", url)
+        else:
+            logger.error("HTTP помилка %s для URL %s", e.status, url)
+    except Exception as exc:
+        # Логування інших неочікуваних помилок з детальним traceback
+        logger.error("Неочікувана помилка при запиті до URL %s: %s", url, exc, exc_info=True)
+    # Повертаємо порожній словник, якщо виникла помилка
+    return {}  
 
 
 async def _fetch_open_interest(
