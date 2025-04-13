@@ -34,36 +34,38 @@ class SimpleCacheHandler:
     # --------- базовий конструктор -----------------------------------------
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
         """
-        Створює локальний Redis клієнт без SSL.
+        Ініціалізує Redis-клієнт без SSL (локально).
         """
         self.client = Redis(
             host=host,
             port=port,
             db=db,
-            decode_responses=True
+            decode_responses=True,
+            ssl=False
         )
 
     # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
+        Ініціалізує Redis через URI (авто-SSL).
         """
-        url_parts = urlparse(redis_url)
-        use_ssl = url_parts.scheme == "rediss"
+        parsed = urlparse(redis_url)
+        scheme = parsed.scheme
 
-        # Створюємо пул з'єднань з правильними параметрами
+        # Redis-пул із автоматичним вибором SSL (лише для rediss://)
         pool = ConnectionPool.from_url(
             redis_url,
             decode_responses=True,
-            ssl=use_ssl  # ← єдине, що потрібно
+            ssl=True if scheme == "rediss" else False
         )
 
+        redis_client = Redis(connection_pool=pool)
+
         inst = cls.__new__(cls)
-        inst.client = Redis(connection_pool=pool)
+        inst.client = redis_client
         return inst
-
-
+    
 
     # --------- основні методи ----------------------------------------------
     async def store_in_cache(
