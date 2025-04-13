@@ -40,20 +40,25 @@ class SimpleCacheHandler:
             port=port,
             db=db,
             decode_responses=True
-            # також БЕЗ ssl
         )
 
     # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює Redis-клієнт з підтримкою rediss:// (Heroku).
-        Redis >= 5.0 не підтримує ssl/ssl_context напряму — все обробляється всередині from_url.
+        Створює Redis клієнт з rediss:// (Heroku) з відключеною верифікацією сертифікатів.
         """
+        ssl_context = None
+        if redis_url.startswith("rediss://"):
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
         redis_client = Redis.from_url(
             redis_url,
-            decode_responses=True
-            # БЕЗ ssl / ssl_context — все вже вбудовано в Redis.from_url
+            decode_responses=True,
+            ssl=ssl_context is not None,
+            ssl_context=ssl_context
         )
 
         inst = cls.__new__(cls)
