@@ -26,23 +26,30 @@ logger.propagate = False
 # ──────────────────────────────────────────────────────────────────
 
 class SimpleCacheHandler:
+    """
+    Легковаговий async-клієнт Redis із коректною підтримкою SSL/TLS для Heroku Redis.
+    """
+
+    # --------- фабрики ------------------------------------------------------
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
         Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
         """
         url_parts = urlparse(redis_url)
-
+        
+        # Встановлюємо SSL параметри, якщо використовуємо редіс через TLS
         ssl_context = None
         if url_parts.scheme == "rediss":
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
+        # Створюємо Redis клієнт із параметрами SSL лише для rediss
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl=ssl_context
+            ssl_context=ssl_context  # ось тут ключова зміна!
         )
 
         inst = cls.__new__(cls)
@@ -51,6 +58,9 @@ class SimpleCacheHandler:
 
     # --------- базовий конструктор -----------------------------------------
     def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
+        """
+        Створює локальний Redis клієнт без SSL.
+        """
         self.client = Redis(
             host=host,
             port=port,
