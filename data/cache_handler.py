@@ -50,21 +50,13 @@ class SimpleCacheHandler:
         Створює клієнт Redis з URI (з автоматичною конфігурацією SSL).
         """
         url_parts = urlparse(redis_url)
-        
-        # Конфігурація SSL з вимкненою перевіркою сертифікатів
-
-        if url_parts.scheme == "rediss":
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-        else:
-            ssl_context = None
+        use_ssl = url_parts.scheme == "rediss"
 
         # Створюємо пул з'єднань з правильними параметрами
         pool = ConnectionPool.from_url(
             redis_url,
             decode_responses=True,
-            ssl_context=ssl_context  # SSL-контекст тут!
+            ssl=use_ssl  # ← єдине, що потрібно
         )
 
         inst = cls.__new__(cls)
