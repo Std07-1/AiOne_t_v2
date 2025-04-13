@@ -35,13 +35,14 @@ class SimpleCacheHandler:
     @classmethod
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
-        Створює клієнт Redis із URI (rediss:// або redis://).
-        Автоматично активує SSL, якщо URI починається з rediss://.
+        Створює клієнт Redis з URI (редис чи редісс).
+        Явно ігнорує перевірку SSL сертифіката (працює гарантовано на Heroku).
         """
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl_cert_reqs=ssl.CERT_NONE  # Ігноруємо перевірку сертифікатів SSL
+            ssl=True,                    # явно активуємо SSL
+            ssl_cert_reqs=ssl.CERT_NONE  # явно відключаємо перевірку сертифіката
         )
         inst = cls.__new__(cls)
         inst.client = redis_client
