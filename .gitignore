@@ -42,7 +42,6 @@ Dockerfile
 datafetcher/__init__.py
 datafetcher/__pycache__/
 datafetcher/cache_handler.py
-datafetcher/file_manager.py
 datafetcher/websocket.py
 datafetcher/raw_data.py
 
