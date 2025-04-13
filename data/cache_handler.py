@@ -25,9 +25,9 @@ logger.propagate = False
 
 class SimpleCacheHandler:
     """
-    Легковаговий async‑клієнт Redis із підтримкою:
+    Легковаговий async-клієнт Redis із підтримкою:
     • host/port (локально)            → redis://localhost:6379/0
-    • URI (Heroku REDIS_URL, rediss)  → rediss://:pwd@host:port
+    • URI (Heroku REDIS_URL, rediss)  → rediss://:pwd@host:port
     """
 
     # --------- фабрики ------------------------------------------------------
@@ -35,13 +35,15 @@ class SimpleCacheHandler:
     def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
         """
         Створює клієнт Redis із URI (rediss:// або redis://).
+        Автоматично активує SSL, якщо URI починається з rediss://.
         """
+        # без явного ssl=True, бо це вже автоматично при rediss://
         redis_client = Redis.from_url(
             redis_url,
             decode_responses=True,
-            ssl=redis_url.startswith("rediss://"),
+            ssl_cert_reqs=None if redis_url.startswith("rediss://") else "required"
         )
-        inst = cls.__new__(cls)        # обходимо __init__
+        inst = cls.__new__(cls)
         inst.client = redis_client
         return inst
 
