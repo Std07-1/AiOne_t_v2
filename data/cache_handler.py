@@ -1,10 +1,10 @@
 # data/cache_handler.py
 """
 Асинхронний клієнт Redis із підтримкою Heroku (TLS → rediss://) та локального
-режиму (redis://). Додає:
-* вимкнену перевірку сертифіката для self‑signed TLS на Heroku;
+режиму (redis://). Особливості:
+* вимкнена перевірка сертифіката для self‑signed TLS на Heroku;
 * уніфіковане DEBUG‑логування (VALID / NO_DATA / ERROR);
-* сумісність із redis==4.5.5 і Rich‑логуванням.
+* сумісність із redis==4.5.5 та Rich‑логуванням.
 
 # === Оновлено 2025‑04‑16
 """
@@ -14,9 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import ssl
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 import pandas as pd
 from redis.asyncio import Redis
@@ -67,19 +66,30 @@ class SimpleCacheHandler:
     # ------------------------------------------------------------------ #
     # внутрішні допоміжні методи
     # ------------------------------------------------------------------ #
-    def _init_from_url(self, redis_url: str) -> None:
-        """Створює клієнт Redis з коректними TLS‑параметрами."""
-        parsed = urlparse(redis_url)
+    @staticmethod
+    def _ensure_tls_query(url: str) -> str:
+        """
+        Для `rediss://…` додає `ssl_cert_reqs=none&ssl_check_hostname=false`,
+        якщо таких параметрів ще немає.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme != "rediss":
+            return url
 
-        # redis‑py 4.5.5 розпізнає TLS за схемою rediss://
-        tls_kwargs = (
-            {
-                "ssl_cert_reqs": ssl.CERT_NONE,     # вимкнути перевірку сертифіката
-                "ssl_check_hostname": False,        # вимкнути перевірку host‑name
-            }
-            if parsed.scheme == "rediss"
-            else {}
-        )
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        # Уже є параметри? — залишаємо
+        if "ssl_cert_reqs" not in qs:
+            qs["ssl_cert_reqs"] = ["none"]
+        if "ssl_check_hostname" not in qs:
+            qs["ssl_check_hostname"] = ["false"]
+
+        new_query = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
+    def _init_from_url(self, redis_url: str) -> None:
+        """Створює клієнт Redis; додає TLS‑параметри через query‑string."""
+        redis_url = self._ensure_tls_query(redis_url)
+        parsed = urlparse(redis_url)
 
         try:
             self.client = Redis.from_url(
@@ -87,7 +97,6 @@ class SimpleCacheHandler:
                 decode_responses=True,
                 health_check_interval=30,           # ping кожні 30 с
                 retry_on_error=[ConnectionError, TimeoutError],
-                **tls_kwargs,
             )
             logger.info(
                 "[Redis][INIT] Connected to %s://%s:%s (tls=%s)",
@@ -100,6 +109,7 @@ class SimpleCacheHandler:
             logger.exception("[Redis][INIT] Redis‑помилка: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[Redis][INIT] Невідома помилка: %s", exc)
+
 
     # ------------------------------------------------------------------ #
     # публічне API
