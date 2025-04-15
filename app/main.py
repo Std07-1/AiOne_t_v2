@@ -89,8 +89,8 @@ async def init_system():
     # 1️⃣  Пробуємо Heroku‑стиль REDIS_URL
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
-        cache_handler = SimpleCacheHandler.from_url(redis_url)
-        logger.info("Підключились до Redis через URI.")
+        cache_handler = SimpleCacheHandler()          # <‑‑ підхопить REDIS_URL або localhost
+        logger.info("Підключились до Redis (%s).", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     else:
         # 2️⃣  Фолбек на локальні змінні
         cache_handler = SimpleCacheHandler(

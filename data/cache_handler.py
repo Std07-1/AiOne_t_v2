@@ -1,19 +1,32 @@
-# cache_handler.py
+# data/cache_handler.py
+"""
+Асинхронний клієнт Redis із підтримкою Heroku (TLS → rediss://) та локального
+режиму (redis://). Додає:
+* автоматичний SSL‑контекст без перевірки CA для Heroku‑сертифіката;
+* уніфіковане DEBUG‑логування статусу кешу (VALID / NO_DATA / ERROR);
+* повністю сумісний із redis==4.5.5 та Rich‑логуванням.
+
+# === Зміна: файл переписано під нові вимоги 2025‑04‑15
+"""
+
+from __future__ import annotations
+
 import json
-import pandas as pd
 import logging
+import os
+import ssl  # === Зміна: додано для створення SSL‑контексту
 from typing import Optional
+from urllib.parse import urlparse
+
 import pandas as pd
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from rich.console import Console
 from rich.logging import RichHandler
-import ssl
-from redis.asyncio import Redis 
-from redis.exceptions import RedisError
-from urllib.parse import urlparse
 
 # ──────────────────────────  логування  ──────────────────────────
 logger = logging.getLogger("cache_handler")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # === Зміна: INFO → DEBUG для глибшого логування
 
 console = Console()
 rich_handler = RichHandler(console=console, show_path=False)
@@ -23,187 +36,189 @@ rich_handler.setFormatter(
 if not logger.handlers:
     logger.addHandler(rich_handler)
 logger.propagate = False
-
 # ──────────────────────────────────────────────────────────────────
+
+
+# === Зміна: константи для статусу кешу
+CACHE_STATUS_VALID = "VALID"
+CACHE_STATUS_NODATA = "NO_DATA"
+
+DEFAULT_TTL = 3_600  # сек
+
+
+def _build_ssl_ctx() -> ssl.SSLContext:
+    """
+    Створює «небезпечний» SSL‑контекст без перевірки сертифіката.
+
+    Потрібно для Heroku Redis, який віддає self‑signed TLS‑сертифікат.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
 
 class SimpleCacheHandler:
     """
-    Легковаговий async-клієнт Redis із підтримкою:
-    • rediss:// (Heroku, автоматичне SSL)
-    • redis:// (локально, без SSL)
+    Легковаговий async‑клієнт Redis.
+
+    Підтримує:
+    * `redis://`  → локальний Redis без TLS;
+    * `rediss://` → Heroku Redis із TLS (self‑signed).
     """
 
-    # --------- базовий конструктор -----------------------------------------
-    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0) -> None:
+    # ------------------------------------------------------------------ #
+    # ініціалізація
+    # ------------------------------------------------------------------ #
+    def __init__(self, redis_url: Optional[str] = None) -> None:
         """
-        Ініціалізація Redis без SSL (локальний режим).
+        Ініціалізує клієнт Redis за URL або за змінною середовища `REDIS_URL`.
+
+        Якщо URL починається з `rediss://` — створюється SSL‑контекст без
+        перевірки CA, аби уникнути `Error 1 connecting …` на Heroku.
         """
+        self.client: Redis | None = None
+        redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self._init_from_url(redis_url)  # === Зміна: єдина точка ініціалізації
+
+    # ------------------------------------------------------------------ #
+    # внутрішні допоміжні методи
+    # ------------------------------------------------------------------ #
+    def _init_from_url(self, redis_url: str) -> None:
+        """Створює клієнт Redis з урахуванням TLS‑контексту."""
+        parsed = urlparse(redis_url)
+        ssl_ctx = _build_ssl_ctx() if parsed.scheme == "rediss" else None  # === Зміна
+
         try:
-            self.client = Redis(
-                host=host,
-                port=port,
-                db=db,
-                decode_responses=True
+            self.client = Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                ssl=ssl_ctx,                    # None → без TLS; ctx → TLS без CA
+                health_check_interval=30,       # ping кожні 30 с
+                retry_on_error=[ConnectionError, TimeoutError],
             )
-            logger.info("Redis ініціалізовано через host/port. {redis_url}")
-            logger.info(f"Redis client type: {type(self.client)}")
-        except Exception as e:
-            logger.error(f"[Redis][INIT:local] Помилка: {e}")
-            self.client = None
+            logger.info(
+                "[Redis][INIT] Connected to %s://%s:%s (ssl=%s)",
+                parsed.scheme, parsed.hostname, parsed.port, bool(ssl_ctx)
+            )
+        except RedisError as exc:
+            logger.exception("[Redis][INIT] Redis‑помилка: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Redis][INIT] Невідома помилка: %s", exc)
 
-    # --------- фабрики ------------------------------------------------------
-    @classmethod
-    def from_url(cls, redis_url: str) -> "SimpleCacheHandler":
-        """
-        Ініціалізує Redis-клієнт з URL (Heroku REDIS_URL).
-        Враховує можливі помилки URI, SSL та версійну несумісність.
-        """
-        inst = cls.__new__(cls)
-        inst.client = None
-
-        try:
-            parsed = urlparse(redis_url)
-
-            if not parsed.scheme.startswith("redis"):
-                raise ValueError(f"Невірна схема URI: {parsed.scheme}")
-
-            # Redis сам розпізнає rediss:// і активує SSL при потребі
-            inst.client = Redis.from_url(redis_url, decode_responses=True)
-            logger.info(f"[Redis][INIT:URI] Підключено до Redis через {parsed.scheme}://...")
-            logger.info(f"[Redis][URI] Порт Redis: {parsed.port}, Хост: {parsed.hostname}")
-
-
-        except ValueError as e:
-            logger.error(f"[Redis][URI] Некоректний URI: {e}")
-        except TypeError as e:
-            logger.error(f"[Redis][TYPE] Несумісність параметрів Redis: {e}")
-        except ConnectionError as e:
-            logger.error(f"[Redis][CONN] Помилка підключення: {e}")
-        except RedisError as e:
-            logger.error(f"[Redis][INIT] Redis‑помилка: {e}")
-        except Exception as e:
-            logger.error(f"[Redis][INIT] Невідома помилка ініціалізації: {e}")
-        except (ConnectionError, TimeoutError) as e:
-            logger.error(f"[Redis][TIMEOUT/CONN] Підключення недоступне: {e}")
-
-        return inst
-    
-
-    # --------- основні методи ----------------------------------------------
+    # ------------------------------------------------------------------ #
+    # публічне API
+    # ------------------------------------------------------------------ #
     async def store_in_cache(
         self,
         symbol: str,
         interval: str,
         data_json: str,
-        ttl: int = 3600,
-        prefix: Optional[str] = None
+        ttl: int = DEFAULT_TTL,
+        prefix: Optional[str] = None,
     ) -> None:
-        """
-        Запис даних у Redis зі сформованим ключем prefix:symbol:interval.
-        """
+        """Записує дані у Redis з ключем `prefix:symbol:interval`."""
         if not self.client:
-            logger.error(f"[Redis][ERROR] [store_in_cache] Клієнт Redis не ініціалізовано — ключ='{key}'")
-            return None
+            logger.error("[Redis][ERROR] client is not initialised")
+            return
         key = self._format_key(symbol, interval, prefix)
         try:
             await self.client.setex(key, ttl, data_json)
-            logger.debug(f"[Redis][SET] Ключ='{key}' збережено. TTL={ttl} сек.")
-        except Exception as e:
-            logger.error(f"[Redis][ERROR] Не вдалося зберегти '{key}': {e}")
+            logger.debug("[Redis][SET] %s (TTL=%s c)", key, ttl)
+        except Exception as exc:
+            logger.error("[Redis][SET] %s failed: %s", key, exc)
 
     async def fetch_from_cache(
         self,
         symbol: str,
         interval: str,
-        prefix: Optional[str] = None
+        prefix: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
         """
-        Отримує дані з Redis у вигляді JSON-списку → DataFrame,
-        або dict (якщо зберігався інший формат).
+        Отримує дані з Redis → DataFrame або dict.
+
+        Логує статус кешу (VALID / NO_DATA) та TTL.
         """
         if not self.client:
-            logger.error(f"[Redis][ERROR] [fetch_from_cache] Клієнт Redis не ініціалізовано — ключ='{key}'")
+            logger.error("[Redis][ERROR] client is not initialised")
             return None
         key = self._format_key(symbol, interval, prefix)
         try:
             data_json = await self.client.get(key)
-            if data_json is None:
-                logger.debug(f"[Redis][NO_DATA] Ключ='{key}' відсутній.")
+            status = CACHE_STATUS_VALID if data_json else CACHE_STATUS_NODATA
+            logger.debug("[Redis][GET] %s → %s", key, status)
+
+            if not data_json:
                 return None
 
             data = json.loads(data_json)
-            # Якщо це список (списки словників) - конвертуємо в DataFrame
             if isinstance(data, list):
                 df = pd.DataFrame(data)
                 if "timestamp" in df.columns:
                     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-
-                    # Логування інформації про отримані дані
-                    last_ts = df["timestamp"].max()
-                    now_utc = pd.Timestamp.utcnow()
-                    age = (now_utc - last_ts)
-
-                    ttl = await self.client.ttl(key)
-                    max_age_str = f"{ttl} сек" if ttl > 0 else "∞"
-                    #logger.debug(
-                    #    f"[Redis][GET:LIST] Ключ='{key}', записів={len(df)}, "
-                    #    f"останній ts={last_ts}, вік={age}, TTL={max_age_str}"
-                    #)
-                else:
-                    logger.debug(f"[Redis][GET:LIST] Ключ='{key}', записів={len(df)} без 'timestamp'")
                 return df
-            else:
-                # Якщо це dict чи інший формат
-                #logger.debug(f"[Redis][GET:DICT] Ключ='{key}', Тип даних={type(data)}")
-                return data
-
-        except Exception as e:
-            logger.error(f"[Redis][ERROR] fetch_from_cache: ключ='{key}', помилка={e}")
+            return data
+        except Exception as exc:
+            logger.error("[Redis][GET] %s failed: %s", key, exc)
             return None
 
-    async def delete_from_cache(self, symbol: str, interval: str, prefix: Optional[str] = None) -> bool:
+    async def delete_from_cache(
+        self, symbol: str, interval: str, prefix: Optional[str] = None
+    ) -> bool:
+        """Видаляє ключ із Redis та повертає успішність операції."""
+        if not self.client:
+            logger.error("[Redis][ERROR] client is not initialised")
+            return False
         key = self._format_key(symbol, interval, prefix)
         try:
             result = await self.client.delete(key)
-            if result == 1:
-                logger.debug(f"[Redis][DEL] Ключ='{key}' успішно видалено.")
-                return True
-            else:
-                logger.debug(f"[Redis][DEL] Ключ='{key}' не знайдено.")
-                return False
-        except Exception as e:
-            logger.error(f"[Redis][ERROR] delete_from_cache: ключ='{key}', {e}")
+            logger.debug("[Redis][DEL] %s → %s", key, bool(result))
+            return bool(result)
+        except Exception as exc:
+            logger.error("[Redis][DEL] %s failed: %s", key, exc)
             return False
 
-    async def is_key_exists(self, symbol: str, interval: str, prefix: Optional[str] = None) -> bool:
+    async def is_key_exists(
+        self, symbol: str, interval: str, prefix: Optional[str] = None
+    ) -> bool:
+        """Перевіряє наявність ключа у Redis."""
+        if not self.client:
+            logger.error("[Redis][ERROR] client is not initialised")
+            return False
         key = self._format_key(symbol, interval, prefix)
         try:
             exists = await self.client.exists(key)
-            logger.debug(f"[Redis][EXISTS] Ключ='{key}', існує={bool(exists)}.")
+            logger.debug("[Redis][EXISTS] %s → %s", key, bool(exists))
             return bool(exists)
-        except Exception as e:
-            logger.error(f"[Redis][ERROR] is_key_exists: ключ='{key}', {e}")
+        except Exception as exc:
+            logger.error("[Redis][EXISTS] %s failed: %s", key, exc)
             return False
 
-    async def get_remaining_ttl(self, symbol: str, interval: str, prefix: Optional[str] = None) -> int:
+    async def get_remaining_ttl(
+        self, symbol: str, interval: str, prefix: Optional[str] = None
+    ) -> int:
         """
-        Отримує скільки лишилось TTL для ключа, або -1 якщо безстроковий, або -2 при помилці.
+        Повертає, скільки TTL залишилось:
+        * >=0 — секунди до протухання;
+        * -1   — безстроковий;
+        * -2   — помилка.
         """
+        if not self.client:
+            logger.error("[Redis][ERROR] client is not initialised")
+            return -2
         key = self._format_key(symbol, interval, prefix)
         try:
             ttl = await self.client.ttl(key)
-            if ttl >= 0:
-                logger.debug(f"[Redis][TTL] Ключ='{key}', залишилось {ttl} сек.")
-            elif ttl == -1:
-                logger.debug(f"[Redis][TTL] Ключ='{key}', безстроковий.")
-            else:
-                logger.debug(f"[Redis][TTL] Ключ='{key}', не знайдено (або помилка).")
+            logger.debug("[Redis][TTL] %s → %s", key, ttl)
             return ttl
-        except Exception as e:
-            logger.error(f"[Redis][ERROR] get_remaining_ttl: ключ='{key}', {e}")
+        except Exception as exc:
+            logger.error("[Redis][TTL] %s failed: %s", key, exc)
             return -2
 
-    # --------- утиліти ------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # утиліти
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _format_key(symbol: str, interval: str, prefix: Optional[str] = None) -> str:
+        """Формує ключ у форматі `prefix:symbol:interval`."""
         return f"{prefix}:{symbol}:{interval}" if prefix else f"{symbol}:{interval}"
