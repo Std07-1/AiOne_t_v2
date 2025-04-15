@@ -2,11 +2,11 @@
 """
 Асинхронний клієнт Redis із підтримкою Heroku (TLS → rediss://) та локального
 режиму (redis://). Додає:
-* автоматичний SSL‑контекст без перевірки CA для Heroku‑сертифіката;
-* уніфіковане DEBUG‑логування статусу кешу (VALID / NO_DATA / ERROR);
-* повністю сумісний із redis==4.5.5 та Rich‑логуванням.
+* вимкнену перевірку сертифіката для self‑signed TLS на Heroku;
+* уніфіковане DEBUG‑логування (VALID / NO_DATA / ERROR);
+* сумісність із redis==4.5.5 і Rich‑логуванням.
 
-# === Зміна: файл переписано під нові вимоги 2025‑04‑15
+# === Оновлено 2025‑04‑16
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import ssl  # === Зміна: додано для створення SSL‑контексту
+import ssl
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -26,7 +26,7 @@ from rich.logging import RichHandler
 
 # ──────────────────────────  логування  ──────────────────────────
 logger = logging.getLogger("cache_handler")
-logger.setLevel(logging.DEBUG)  # === Зміна: INFO → DEBUG для глибшого логування
+logger.setLevel(logging.DEBUG)                         # детальне логування
 
 console = Console()
 rich_handler = RichHandler(console=console, show_path=False)
@@ -38,24 +38,10 @@ if not logger.handlers:
 logger.propagate = False
 # ──────────────────────────────────────────────────────────────────
 
-
-# === Зміна: константи для статусу кешу
+# Константи
 CACHE_STATUS_VALID = "VALID"
 CACHE_STATUS_NODATA = "NO_DATA"
-
 DEFAULT_TTL = 3_600  # сек
-
-
-def _build_ssl_ctx() -> ssl.SSLContext:
-    """
-    Створює «небезпечний» SSL‑контекст без перевірки сертифіката.
-
-    Потрібно для Heroku Redis, який віддає self‑signed TLS‑сертифікат.
-    """
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
 
 
 class SimpleCacheHandler:
@@ -73,33 +59,42 @@ class SimpleCacheHandler:
     def __init__(self, redis_url: Optional[str] = None) -> None:
         """
         Ініціалізує клієнт Redis за URL або за змінною середовища `REDIS_URL`.
-
-        Якщо URL починається з `rediss://` — створюється SSL‑контекст без
-        перевірки CA, аби уникнути `Error 1 connecting …` на Heroku.
         """
         self.client: Redis | None = None
         redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        self._init_from_url(redis_url)  # === Зміна: єдина точка ініціалізації
+        self._init_from_url(redis_url)
 
     # ------------------------------------------------------------------ #
     # внутрішні допоміжні методи
     # ------------------------------------------------------------------ #
     def _init_from_url(self, redis_url: str) -> None:
-        """Створює клієнт Redis з урахуванням TLS‑контексту."""
+        """Створює клієнт Redis з коректними TLS‑параметрами."""
         parsed = urlparse(redis_url)
-        ssl_ctx = _build_ssl_ctx() if parsed.scheme == "rediss" else None  # === Зміна
+
+        # redis‑py 4.5.5 розпізнає TLS за схемою rediss://
+        tls_kwargs = (
+            {
+                "ssl_cert_reqs": ssl.CERT_NONE,     # вимкнути перевірку сертифіката
+                "ssl_check_hostname": False,        # вимкнути перевірку host‑name
+            }
+            if parsed.scheme == "rediss"
+            else {}
+        )
 
         try:
             self.client = Redis.from_url(
                 redis_url,
                 decode_responses=True,
-                ssl=ssl_ctx,                    # None → без TLS; ctx → TLS без CA
-                health_check_interval=30,       # ping кожні 30 с
+                health_check_interval=30,           # ping кожні 30 с
                 retry_on_error=[ConnectionError, TimeoutError],
+                **tls_kwargs,
             )
             logger.info(
-                "[Redis][INIT] Connected to %s://%s:%s (ssl=%s)",
-                parsed.scheme, parsed.hostname, parsed.port, bool(ssl_ctx)
+                "[Redis][INIT] Connected to %s://%s:%s (tls=%s)",
+                parsed.scheme,
+                parsed.hostname,
+                parsed.port,
+                parsed.scheme == "rediss",
             )
         except RedisError as exc:
             logger.exception("[Redis][INIT] Redis‑помилка: %s", exc)
