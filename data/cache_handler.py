@@ -157,7 +157,6 @@ class SimpleCacheHandler:
     @with_retry
     async def store_in_cache(
         self,
-        *,
         symbol: str,
         interval: str,
         data_json: str,
@@ -170,7 +169,7 @@ class SimpleCacheHandler:
 
     @with_retry
     async def fetch_from_cache(
-        self, *, symbol: str, interval: str, prefix: Optional[str] = None
+        self, symbol: str, interval: str, prefix: Optional[str] = None
     ) -> Optional[pd.DataFrame | dict]:
         key = self._format_key(symbol, interval, prefix)
         data_json = await self.client.get(key)
@@ -188,7 +187,7 @@ class SimpleCacheHandler:
 
     @with_retry
     async def delete_from_cache(
-        self, *, symbol: str, interval: str, prefix: Optional[str] = None
+        self, symbol: str, interval: str, prefix: Optional[str] = None
     ) -> bool:
         key = self._format_key(symbol, interval, prefix)
         deleted = await self.client.delete(key)
@@ -197,7 +196,7 @@ class SimpleCacheHandler:
 
     @with_retry
     async def is_key_exists(
-        self, *, symbol: str, interval: str, prefix: Optional[str] = None
+        self, symbol: str, interval: str, prefix: Optional[str] = None
     ) -> bool:
         key = self._format_key(symbol, interval, prefix)
         exists = await self.client.exists(key)
@@ -206,7 +205,7 @@ class SimpleCacheHandler:
 
     @with_retry
     async def get_remaining_ttl(
-        self, *, symbol: str, interval: str, prefix: Optional[str] = None
+        self, symbol: str, interval: str, prefix: Optional[str] = None
     ) -> int:
         key = self._format_key(symbol, interval, prefix)
         ttl = await self.client.ttl(key)
