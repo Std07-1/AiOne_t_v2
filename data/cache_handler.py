@@ -1,17 +1,22 @@
 """
 data/cache_handler.py
 ────────────────────────────────────────────────────────────────────────────
-Універсальний асинхронний клієнт для Redis:
+Універсальний асинхронний клієнт для Redis.
 
-1. Підтримує:
-   • Heroku (`rediss://`, self‑signed TLS)  
-   • Локальний Redis (`redis://` або host/port)  
-2. Вбудований повтор із back‑off при мережевих збоях (до MAX_RETRIES).  
-3. Обмежує пул з’єднань (max_connections) → безпечний для Heroku Mini.  
-4. Детальне Rich‑логування з рівнем DEBUG.  
-5. Додаткові методи‑утиліти (`ping`, `close`, `get_json`, `set_json`).  
-6. Працює з redis‑py 4.5.5, тож ми не використовуємо параметрів,
-   доданих у пізніших версіях.
+✔  Підтримка Heroku (`rediss://`, self‑signed TLS) і локального Redis.  
+✔  Автоматичні повтори (back‑off + jitter) при мережевих збоях.  
+✔  Ліміт пулу з’єднань (MAX_CONNECTIONS = 18) — безпечна межа Heroku Mini.  
+✔  Детальне Rich‑логування (DEBUG).  
+✔  Додаткові утиліти `ping`, `close`, `set_json`, `get_json`.  
+✔  Сумісність із redis‑py 4.5.5 — жодних «свіжих» параметрів.
+
+Типові сценарії помилок, які перехоплюються і лікуються:
+    • TCP обрив | `ConnectionResetError`
+    • TLS handshake | `ConnectionError`
+    • `Too many connections` від сервера Redis
+    • `TimeoutError` клієнта
+    • `BusyLoadingError` (перезапуск Redis)
+    • Некоректний або прострочений self‑signed сертифікат
 
 Автор: AiOne_t • Оновлено 2025‑04‑18
 """
@@ -33,7 +38,7 @@ from redis.asyncio import Redis
 from redis.exceptions import (
     AuthenticationError,
     BusyLoadingError,
-    ConnectionError as RedisConnError,
+    ConnectionError as RedisConnectionError,
     RedisError,
     ResponseError,
     TimeoutError as RedisTimeoutError,
@@ -41,7 +46,7 @@ from redis.exceptions import (
 from rich.console import Console
 from rich.logging import RichHandler
 
-# ──────────────────────────── ЛОГУВАННЯ ────────────────────────────
+# ─────────────────────────── ЛОГУВАННЯ ────────────────────────────
 logger = logging.getLogger("cache_handler")
 logger.setLevel(logging.DEBUG)
 
@@ -53,84 +58,80 @@ rich_handler.setFormatter(
 if not logger.handlers:
     logger.addHandler(rich_handler)
 logger.propagate = False
-# ────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
 
-# ──────────── Константи та налаштування, легко редагувати ───────────
+# ──────────── Константи та налаштування ────────────
 CACHE_STATUS_VALID = "VALID"
 CACHE_STATUS_NODATA = "NO_DATA"
 
-DEFAULT_TTL: int = 60 * 60  # 1 год за замовчуванням
-MAX_RETRIES: int = 3        # скільки разів намагатись повторити
-BASE_DELAY: float = 0.4     # початкова затримка (сек) перед повтором
-MAX_CONNECTIONS: int = 10   # safe‑ліміт для плану Heroku Mini (18 max)
-HEALTH_CHECK_SEC: int = 30  # Redis Ping кожні N сек для підтримання з’єднання
-# ────────────────────────────────────────────────────────────────────
-
+DEFAULT_TTL: int = 60 * 60          # 1 год
+MAX_RETRIES: int = 3                # спроби при збої
+BASE_DELAY: float = 0.4             # початкова затримка між спробами
+MAX_CONNECTIONS: int = 18           # ліміт для Heroku Mini (18/20 allowed)
+HEALTH_CHECK_SEC: int = 30          # періодичний PING
+# ───────────────────────────────────────────────────
 
 # ╭─ утиліта‑декоратор з автоматичними повторами ─╮
 def with_retry(func):
     """
-    Декоратор для методів, що роблять I/O з Redis.
+    Декоратор для методів, що працюють із Redis.
 
-    * Повторює виклик до MAX_RETRIES разів (експоненційний back‑off + jitter).
-    * Перехоплює як системні (`ConnectionError`, `TimeoutError`),
-      так і redis‑py винятки.
-    * На кожному збої намагається «вилікувати» пул (`disconnect()`).
+    * Повтор до MAX_RETRIES із back‑off + jitter.
+    * Перехоплює як built‑in (`ConnectionError`, `TimeoutError`),
+      так і redis‑py (`RedisConnectionError`, `RedisTimeoutError`) винятки.
+    * Після кожного збою закриває ВСІ з’єднання пулу (`disconnect()`),
+      щоб не накопичувалися «завислі» конекшени.
     """
 
     retriable = (
-        ConnectionError,
-        TimeoutError,
-        ConnectionResetError,
-        RedisConnError,
-        RedisTimeoutError,
+        ConnectionError,            # built‑in
+        TimeoutError,               # built‑in
+        ConnectionResetError,       # TCP RST
+        RedisConnectionError,       # redis‑py (включає Too many connections)
+        RedisTimeoutError,          # redis‑py
     )
 
     @wraps(func)
     async def wrapper(self: "SimpleCacheHandler", *args, **kwargs):
         delay = BASE_DELAY
-        for attempt in range(1, MAX_RETRIES + 2):  # 1 + MAX_RETRIES
+        for attempt in range(1, MAX_RETRIES + 2):               # 1 + MAX_RETRIES
             try:
                 return await func(self, *args, **kwargs)
             except retriable as exc:
                 logger.warning(
                     "[Redis][RETRY %d/%d] %s: %s",
-                    attempt,
-                    MAX_RETRIES,
-                    func.__name__,
-                    exc,
+                    attempt, MAX_RETRIES, func.__name__, exc
                 )
-                # «Лікуємо» пул з’єднань
+                # «Лікуємо» пул: закриваємо всі існуючі конекшени
                 try:
-                    self.client.connection_pool.disconnect(inuse_connections=True)
+                    await self.client.connection_pool.disconnect(inuse_connections=True)
                 except Exception:
                     pass
 
                 if attempt > MAX_RETRIES:
                     raise
 
-                # jitter — щоб уникнути «шторму» паралельних повторів
+                # jitter, щоб розсинхронізувати паралельні корутини
                 await asyncio.sleep(delay + random.uniform(0, delay / 4))
                 delay *= 2
 
     return wrapper
-
-
 # ╰───────────────────────────────────────────────╯
 
 
 class SimpleCacheHandler:
     """
-    Єдиний асинхронний клієнт Redis на процес.
+    Асинхронний клієнт Redis (Singleton per process).
 
-    Parameters
-    ----------
+    Параметри
+    ---------
     redis_url : str | None
-        Повна URI‑стрічка; якщо не задано — читається з ENV `REDIS_URL`.
-    host, port, db : опціональна трійка для локального Redis.
+        Повна URI‑стрічка. Якщо не задано — читається з ENV `REDIS_URL`.
+    host, port, db : опціональна трійка для локального Redis
+        (ігнорується, якщо є `redis_url`).
     """
 
-    # ────────────────────── ініціалізація ──────────────────────
+    # ─────────────────── ініціалізація ────────────────────
     def __init__(
         self,
         redis_url: str | None = None,
@@ -154,10 +155,9 @@ class SimpleCacheHandler:
     @staticmethod
     def _add_tls_params(url: str) -> str:
         """
-        Для `rediss://…` додаємо параметри:
-        * `ssl_cert_reqs=none`
-        * `ssl_check_hostname=false`
-        щоб обійти self‑signed сертифікат Heroku.
+        Для `rediss://…` додає:
+        • `ssl_cert_reqs=none`         – вимикає валідацію сертифіката  
+        • `ssl_check_hostname=false`   – вимикає перевірку CN
         """
         parsed = urlparse(url)
         if parsed.scheme != "rediss":
@@ -166,13 +166,10 @@ class SimpleCacheHandler:
         qs = parse_qs(parsed.query, keep_blank_values=True)
         qs.setdefault("ssl_cert_reqs", ["none"])
         qs.setdefault("ssl_check_hostname", ["false"])
-        new_query = urlencode(qs, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
+        return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
     def _create_client(self, redis_url: str) -> Redis:
-        """
-        Створює підключення з обмеженим пулом і health‑check‑пінгами.
-        """
+        """Створює Redis‑клієнт з обмеженим пулом та захистом TLS."""
         redis_url = self._add_tls_params(redis_url)
         parsed = urlparse(redis_url)
 
@@ -183,31 +180,31 @@ class SimpleCacheHandler:
                 health_check_interval=HEALTH_CHECK_SEC,
                 socket_keepalive=True,
                 max_connections=MAX_CONNECTIONS,
-                retry_on_error=[RedisConnError, RedisTimeoutError],
+                retry_on_error=[RedisConnectionError, RedisTimeoutError],
             )
             logger.info(
                 "[Redis][INIT] Connected to %s://%s:%s (TLS=%s, pool=%s)",
-                parsed.scheme,
-                parsed.hostname,
-                parsed.port,
-                parsed.scheme == "rediss",
-                MAX_CONNECTIONS,
+                parsed.scheme, parsed.hostname, parsed.port,
+                parsed.scheme == "rediss", MAX_CONNECTIONS
             )
             return client
+
+        # Деталізуємо типові критичні кейси:
         except (AuthenticationError, ResponseError) as exc:
-            logger.critical("[Redis][AUTH] Неавторизовано або config‑помилка: %s", exc)
+            logger.critical("[Redis][AUTH] Creds/config error: %s", exc)
             sys.exit(1)
         except BusyLoadingError as exc:
-            logger.error("[Redis][BUSY] Redis завантажує дані: %s", exc)
+            logger.error("[Redis][BUSY] Redis is loading data: %s", exc)
             raise
         except RedisError as exc:
-            logger.exception("[Redis][INIT] Redis‑помилка: %s", exc)
+            logger.exception("[Redis][INIT] Redis‑error: %s", exc)
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[Redis][INIT] Невідома помилка: %s", exc)
+            logger.exception("[Redis][INIT] Unknown error: %s", exc)
             raise
 
-    # ───────────────────── публічне API ──────────────────────
+    # ────────────────────── ПУБЛІЧНЕ API ──────────────────────
+    # ----------- базові операції (JSON‑рядок як payload) -----------
     @with_retry
     async def store_in_cache(
         self,
@@ -217,14 +214,10 @@ class SimpleCacheHandler:
         ttl: int = DEFAULT_TTL,
         prefix: Optional[str] = None,
     ) -> None:
-        """
-        Зберегти JSON‑рядок у Redis під ключем:
-
-            [prefix:]<symbol>:<interval>
-        """
+        """Зберегти рядок JSON під ключем `[prefix:]symbol:interval`."""
         key = self._format_key(symbol, interval, prefix)
         await self.client.setex(key, ttl, data_json)
-        logger.debug("[Redis][SET] %s (TTL=%s с)", key, ttl)
+        logger.debug("[Redis][SET] %s (TTL=%s c)", key, ttl)
 
     @with_retry
     async def fetch_from_cache(
@@ -235,8 +228,8 @@ class SimpleCacheHandler:
     ) -> Optional[pd.DataFrame | dict]:
         """
         Повертає:
-        • DataFrame — якщо збережено список об’єктів;  
-        • dict / raw type — якщо інший формат;  
+        • DataFrame — якщо збережено список об'єктів;  
+        • dict / raw — для інших форматів;  
         • None — якщо ключа нема.
         """
         key = self._format_key(symbol, interval, prefix)
@@ -272,6 +265,7 @@ class SimpleCacheHandler:
         logger.debug("[Redis][DEL] %s → %s", key, bool(deleted))
         return bool(deleted)
 
+    # ----------- інформаційні операції -----------
     @with_retry
     async def is_key_exists(
         self,
@@ -291,31 +285,36 @@ class SimpleCacheHandler:
         interval: str,
         prefix: Optional[str] = None,
     ) -> int:
-        """Повертає TTL у секундах або -1 (безстроковий) / -2 (помилка)."""
+        """
+        Повертає TTL у секундах:
+        • >=0 – скільки залишилось;  
+        • -1  – безстроковий;  
+        • -2  – помилка.
+        """
         key = self._format_key(symbol, interval, prefix)
         ttl = await self.client.ttl(key)
         logger.debug("[Redis][TTL] %s → %s", key, ttl)
         return ttl
 
-    # ───────────── додаткові корисні методи ─────────────
+    # ----------- корисні утиліти -----------
     @with_retry
     async def ping(self) -> bool:
-        """Перевірка з’єднання; повертає True/False."""
+        """Health‑check з’єднання (`PING`)."""
         try:
             pong = await self.client.ping()
             logger.debug("[Redis][PING] → %s", pong)
             return bool(pong)
         except RedisError as exc:
-            logger.error("[Redis][PING] Помилка: %s", exc)
+            logger.error("[Redis][PING] Error: %s", exc)
             return False
 
     async def close(self) -> None:
-        """Акуратно закриває пул з’єднань (для graceful‑shutdown)."""
+        """Graceful‑shutdown: закриває клієнт і пул."""
         await self.client.close()
         await self.client.connection_pool.disconnect(inuse_connections=True)
-        logger.info("[Redis][CLOSE] З’єднання закрито.")
+        logger.info("[Redis][CLOSE] Пул з’єднань закрито.")
 
-    # Швидкі обгортки для зберігання / зчитування JSON‑об’єктів
+    # ----------- обгортки для роботи з Python‑об’єктами -----------
     async def set_json(
         self,
         symbol: str,
@@ -326,6 +325,7 @@ class SimpleCacheHandler:
         prefix: Optional[str] = None,
         ensure_ascii: bool = False,
     ) -> None:
+        """Серіалізує `obj` у JSON та кладе в кеш."""
         await self.store_in_cache(
             symbol,
             interval,
@@ -340,6 +340,7 @@ class SimpleCacheHandler:
         interval: str,
         prefix: Optional[str] = None,
     ) -> Optional[Any]:
+        """Повертає Python‑об’єкт, якщо у кеші збережено JSON."""
         data = await self.fetch_from_cache(symbol, interval, prefix)
         if isinstance(data, (dict, list)):
             return data
@@ -348,5 +349,5 @@ class SimpleCacheHandler:
     # ─────────────────────── утиліти ───────────────────────
     @staticmethod
     def _format_key(symbol: str, interval: str, prefix: Optional[str]) -> str:
-        """Формує ключ «prefix:symbol:interval» або «symbol:interval»."""
+        """Повертає ключ формату `prefix:symbol:interval` або `symbol:interval`."""
         return f"{prefix}:{symbol}:{interval}" if prefix else f"{symbol}:{interval}"
