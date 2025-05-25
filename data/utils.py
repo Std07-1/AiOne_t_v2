@@ -4,7 +4,27 @@ import numpy as np
 import pandas as pd
 from typing import Any, Union
 
-logger = logging.getLogger("make_serializable")
+logger = logging.getLogger("utils")
+
+def get_ttl_for_interval(interval: str) -> int:
+    """
+    Повертає рекомендований TTL (у секундах) для заданого інтервалу.
+    Можна розширювати за необхідності.
+
+    Наприклад:
+      - "1d" (daily): 24 години
+      - "4h": 4 години
+      - "1h": 1 година
+      - "30m": 30 хвилин
+    """
+    mapping = {
+        "1d": 24 * 3600,   # 24 години
+        "4h": 4 * 3600,    # 4 години
+        "1h": 3600,        # 1 година
+        "30m": 1800        # 30 хвилин (приклад)
+        # ... додай ще інтервали за потреби
+    }
+    return mapping.get(interval, 3600)  # За замовчуванням 1 година, якщо інше не вказано
 
 
 def make_serializable(obj: Any) -> Any:

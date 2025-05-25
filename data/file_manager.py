@@ -5,9 +5,10 @@ from datetime import datetime
 from typing import Dict, Any, Union, Optional
 import pandas as pd
 from redis.asyncio import Redis
-from datafetcher.serializer import make_serializable, serialize_to_json
+from .utils import serialize_to_json
 
 logger = logging.getLogger("file_manager")
+logger.setLevel(logging.WARNING)
 
 
 class FileManager:

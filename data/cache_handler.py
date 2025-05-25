@@ -1,27 +1,25 @@
+# data/cache_handler.py
+# -*- coding: utf-8 -*-
 """
-data/cache_handler.py
-────────────────────────────────────────────────────────────────────────────
-Універсальний асинхронний клієнт для Redis.
+Universal async Redis client for AiOne_t
+========================================
 
-✔  Підтримка Heroku (`rediss://`, self‑signed TLS) і локального Redis.  
-✔  Автоматичні повтори (back‑off + jitter) при мережевих збоях.  
-✔  Ліміт пулу з’єднань (MAX_CONNECTIONS = 18) — безпечна межа Heroku Mini.  
-✔  Детальне Rich‑логування (DEBUG).  
-✔  Додаткові утиліти `ping`, `close`, `set_json`, `get_json`.  
-✔  Сумісність із redis‑py 4.5.5 — жодних «свіжих» параметрів.
+✔ Works with both local Redis and Heroku (`rediss://` + self-signed TLS).
+✔ Built-in retry with exponential backoff & jitter on network errors.
+✔ Safe connection-pool cap (MAX_CONNECTIONS = 18, Heroku Mini limit).
+✔ Rich DEBUG-logging with head:3\tail:3 data snapshots.
+✔ Helpers: ping, close, set_json, get_json.
+✔ 100% compatible with redis-py 4.5.5 – no bleeding-edge params.
+✔ NEW 2025-04-20
+    • raw=True → store/fetch binary blobs (e.g. LZ4-compressed DataFrame).
+    • Pipeline helper: store → publish in a single RTT.
+    • Per-write status-logging (VALID / NO_DATA).
 
-Типові сценарії помилок, які перехоплюються і лікуються:
-    • TCP обрив | `ConnectionResetError`
-    • TLS handshake | `ConnectionError`
-    • `Too many connections` від сервера Redis
-    • `TimeoutError` клієнта
-    • `BusyLoadingError` (перезапуск Redis)
-    • Некоректний або прострочений self‑signed сертифікат
-
-Автор: AiOne_t • Оновлено 2025‑04‑18
+Typical failures handled automatically:
+--------------------------------------
+* ConnectionResetError, TimeoutError, BusyLoadingError,
+  Heroku "Too many connections", TLS handshake issues, etc.
 """
-
-from __future__ import annotations
 
 import asyncio
 import json
@@ -30,8 +28,7 @@ import os
 import random
 import sys
 from functools import wraps
-from typing import Any, Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from typing import Any, Optional, List, Union
 
 import pandas as pd
 from redis.asyncio import Redis
@@ -45,276 +42,245 @@ from redis.exceptions import (
 )
 from rich.console import Console
 from rich.logging import RichHandler
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-# ─────────────────────────── ЛОГУВАННЯ ────────────────────────────
+# ───────────────────────────── Logging ──────────────────────────────
+# --- Логування ---
 logger = logging.getLogger("cache_handler")
-logger.setLevel(logging.DEBUG)
-
-console = Console()
-rich_handler = RichHandler(console=console, show_path=False, omit_repeated_times=False)
-rich_handler.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-)
-if not logger.handlers:
-    logger.addHandler(rich_handler)
+logger.setLevel(logging.WARNING)
+logger.handlers.clear()
+logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False
-# ───────────────────────────────────────────────────────────────────
 
-# ──────────── Константи та налаштування ────────────
+# ────────────────────────── Configuration ───────────────────────────
+DEFAULT_TTL = 60 * 60       # 1 hour
+MAX_RETRIES = 3
+BASE_DELAY = 0.4            # initial back-off seconds
+MAX_CONNECTIONS = 18        # safe pool size
+HEALTH_CHECK_SEC = 30
+_REDIS_SEM = asyncio.Semaphore(MAX_CONNECTIONS - 2)  # limit concurrency
 CACHE_STATUS_VALID = "VALID"
 CACHE_STATUS_NODATA = "NO_DATA"
 
-DEFAULT_TTL: int = 60 * 60          # 1 год
-MAX_RETRIES: int = 3                # спроби при збої
-BASE_DELAY: float = 0.4             # початкова затримка між спробами
-MAX_CONNECTIONS: int = 18           # ліміт для Heroku Mini (18/20 allowed)
-HEALTH_CHECK_SEC: int = 30          # періодичний PING
-# ───────────────────────────────────────────────────
-
-# ╭─ утиліта‑декоратор з автоматичними повторами ─╮
+# ╭──────────────────────── retry decorator ─────────────────────╮
 def with_retry(func):
     """
-    Декоратор для методів, що працюють із Redis.
+    Async-retry + connection-pool limiter.
 
-    * Повтор до MAX_RETRIES із back‑off + jitter.
-    * Перехоплює як built‑in (`ConnectionError`, `TimeoutError`),
-      так і redis‑py (`RedisConnectionError`, `RedisTimeoutError`) винятки.
-    * Після кожного збою закриває ВСІ з’єднання пулу (`disconnect()`),
-      щоб не накопичувалися «завислі» конекшени.
+    • Limits concurrent ops via `_REDIS_SEM` (avoids too many connections).
+    • Retries up to MAX_RETRIES with exponential backoff + jitter.
     """
-
     retriable = (
-        ConnectionError,            # built‑in
-        TimeoutError,               # built‑in
-        ConnectionResetError,       # TCP RST
-        RedisConnectionError,       # redis‑py (включає Too many connections)
-        RedisTimeoutError,          # redis‑py
+        ConnectionError,
+        TimeoutError,
+        ConnectionResetError,
+        RedisConnectionError,
+        RedisTimeoutError,
     )
 
     @wraps(func)
-    async def wrapper(self: "SimpleCacheHandler", *args, **kwargs):
+    async def wrapper(self, *args, **kwargs):
         delay = BASE_DELAY
-        for attempt in range(1, MAX_RETRIES + 2):               # 1 + MAX_RETRIES
+        for attempt in range(1, MAX_RETRIES + 2):
             try:
-                return await func(self, *args, **kwargs)
+                async with _REDIS_SEM:
+                    return await func(self, *args, **kwargs)
             except retriable as exc:
                 logger.warning(
-                    "[Redis][RETRY %d/%d] %s: %s",
-                    attempt, MAX_RETRIES, func.__name__, exc
+                    "[Redis][RETRY %d/%d] %s → %s",
+                    attempt, MAX_RETRIES, func.__name__, exc,
                 )
-                # «Лікуємо» пул: закриваємо всі існуючі конекшени
+                # drop busy connections
                 try:
                     await self.client.connection_pool.disconnect(inuse_connections=True)
                 except Exception:
                     pass
-
                 if attempt > MAX_RETRIES:
                     raise
-
-                # jitter, щоб розсинхронізувати паралельні корутини
                 await asyncio.sleep(delay + random.uniform(0, delay / 4))
                 delay *= 2
-
     return wrapper
-# ╰───────────────────────────────────────────────╯
-
+# ╰──────────────────────────────────────────────────────────────╯
 
 class SimpleCacheHandler:
     """
-    Асинхронний клієнт Redis (Singleton per process).
+    Async Redis wrapper (singleton per process).
 
-    Параметри
-    ---------
+    Parameters
+    ----------
     redis_url : str | None
-        Повна URI‑стрічка. Якщо не задано — читається з ENV `REDIS_URL`.
-    host, port, db : опціональна трійка для локального Redis
-        (ігнорується, якщо є `redis_url`).
+        Full connection URI or reads REDIS_URL env.
+    host : str | None, port : int | None, db : int
+        Convenience for local Redis (ignored if redis_url provided).
     """
+    FAST_SYMBOLS_KEY = "ai_one:fast_symbols"
 
-    # ─────────────────── ініціалізація ────────────────────
     def __init__(
         self,
-        redis_url: str | None = None,
+        redis_url: Optional[str] = None,
         *,
-        host: str | None = None,
-        port: int | None = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         db: int = 0,
     ) -> None:
-        # 1. Визначаємо URI
-        if redis_url is None:
-            redis_url = os.getenv("REDIS_URL")
-        if not redis_url and host:
-            redis_url = f"redis://{host}:{port or 6379}/{db}"
-        if not redis_url:
-            redis_url = "redis://localhost:6379/0"
+        self.redis_url = (
+            redis_url
+            or os.getenv("REDIS_URL")
+            or f"redis://{host or 'localhost'}:{port or 6379}/{db}"
+        )
+        self.client: Redis = self._create_client(self.redis_url)
 
-        # 2. Створюємо клієнт
-        self.client: Redis = self._create_client(redis_url)
-
-    # ─────────────────── внутрішні методи ────────────────────
     @staticmethod
-    def _add_tls_params(url: str) -> str:
-        """
-        Для `rediss://…` додає:
-        • `ssl_cert_reqs=none`         – вимикає валідацію сертифіката  
-        • `ssl_check_hostname=false`   – вимикає перевірку CN
-        """
+    def _tls_friendly(url: str) -> str:
+        """Injects ssl_cert_reqs=none & ssl_check_hostname=false for rediss://"""
         parsed = urlparse(url)
         if parsed.scheme != "rediss":
             return url
-
         qs = parse_qs(parsed.query, keep_blank_values=True)
         qs.setdefault("ssl_cert_reqs", ["none"])
         qs.setdefault("ssl_check_hostname", ["false"])
         return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
-    def _create_client(self, redis_url: str) -> Redis:
-        """Створює Redis‑клієнт з обмеженим пулом та захистом TLS."""
-        redis_url = self._add_tls_params(redis_url)
-        parsed = urlparse(redis_url)
-
+    def _create_client(self, url: str) -> Redis:
+        url = self._tls_friendly(url)
+        parsed = urlparse(url)
         try:
-            client = Redis.from_url(
-                redis_url,
-                decode_responses=True,
+            cli = Redis.from_url(
+                url,
+                decode_responses=False,  # binary-safe
                 health_check_interval=HEALTH_CHECK_SEC,
                 socket_keepalive=True,
                 max_connections=MAX_CONNECTIONS,
                 retry_on_error=[RedisConnectionError, RedisTimeoutError],
             )
-            logger.info(
-                "[Redis][INIT] Connected to %s://%s:%s (TLS=%s, pool=%s)",
-                parsed.scheme, parsed.hostname, parsed.port,
-                parsed.scheme == "rediss", MAX_CONNECTIONS
+            logger.debug(
+                "[Redis][INIT] %s://%s:%s  TLS=%s  pool=%d",
+                parsed.scheme,
+                parsed.hostname,
+                parsed.port,
+                parsed.scheme == "rediss",
+                MAX_CONNECTIONS,
             )
-            return client
-
-        # Деталізуємо типові критичні кейси:
+            return cli
         except (AuthenticationError, ResponseError) as exc:
-            logger.critical("[Redis][AUTH] Creds/config error: %s", exc)
+            logger.critical("[Redis][AUTH] %s", exc)
             sys.exit(1)
         except BusyLoadingError as exc:
-            logger.error("[Redis][BUSY] Redis is loading data: %s", exc)
+            logger.error("[Redis][BUSY] %s", exc)
             raise
         except RedisError as exc:
-            logger.exception("[Redis][INIT] Redis‑error: %s", exc)
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[Redis][INIT] Unknown error: %s", exc)
+            logger.exception("[Redis][INIT] %s", exc)
             raise
 
-    # ────────────────────── ПУБЛІЧНЕ API ──────────────────────
-    # ----------- базові операції (JSON‑рядок як payload) -----------
+    @staticmethod
+    def _key(symbol: str, interval: str, prefix: Optional[str]) -> str:
+        return f"{prefix}:{symbol}:{interval}" if prefix else f"{symbol}:{interval}"
+
     @with_retry
     async def store_in_cache(
         self,
         symbol: str,
         interval: str,
-        data_json: str,
+        data: Union[bytes, str],
+        *,
         ttl: int = DEFAULT_TTL,
         prefix: Optional[str] = None,
+        raw: bool = False,
+        publish_channel: Optional[str] = None,
+        publish_message: Optional[str] = None,
     ) -> None:
-        """Зберегти рядок JSON під ключем `[prefix:]symbol:interval`."""
-        key = self._format_key(symbol, interval, prefix)
-        await self.client.setex(key, ttl, data_json)
-        logger.debug("[Redis][SET] %s (TTL=%s c)", key, ttl)
+        """
+        SETEX key value TTL + optional PUB/SUB publish.
+        data: bytes or JSON-serializable str.
+        """
+        key = self._key(symbol, interval, prefix)
+        val = data if isinstance(data, bytes) else str(data).encode()
+        pipe = self.client.pipeline()
+        pipe.setex(key, ttl, val)
+        if publish_channel:
+            msg = (publish_message or symbol).encode()
+            pipe.publish(publish_channel, msg)
+        await pipe.execute()
+        logger.debug("[Redis][SET] %s %s(%ds) size=%dB",
+                     key,
+                     CACHE_STATUS_VALID,
+                     ttl,
+                     len(val),
+        )
 
     @with_retry
     async def fetch_from_cache(
         self,
         symbol: str,
         interval: str,
+        *,
         prefix: Optional[str] = None,
-    ) -> Optional[pd.DataFrame | dict]:
+        raw: bool = False,
+    ) -> Optional[Union[bytes, pd.DataFrame, dict]]:
         """
-        Повертає:
-        • DataFrame — якщо збережено список об'єктів;  
-        • dict / raw — для інших форматів;  
-        • None — якщо ключа нема.
+        GET key → bytes|DataFrame|dict.
+        raw=True returns bytes.
         """
-        key = self._format_key(symbol, interval, prefix)
-        data_json = await self.client.get(key)
-        status = CACHE_STATUS_VALID if data_json else CACHE_STATUS_NODATA
-        logger.debug("[Redis][GET] %s → %s", key, status)
-
-        if not data_json:
+        key = self._key(symbol, interval, prefix)
+        val: Optional[bytes] = await self.client.get(key)
+        ttl = await self.client.ttl(key)
+        status = CACHE_STATUS_VALID if val else CACHE_STATUS_NODATA
+        logger.debug("[Redis][GET] %s → %s ttl=%ss", key, status, ttl)
+        if val is None:
             return None
-
+        if raw:
+            return val
         try:
-            data = json.loads(data_json)
-        except json.JSONDecodeError as exc:
-            logger.error("[Redis][DECODE] %s: %s", key, exc)
+            decoded = json.loads(val.decode())
+        except Exception as e:
+            logger.error("[Redis][DECODE] %s → %s", key, e)
             return None
-
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
+        if isinstance(decoded, list):
+            df = pd.DataFrame(decoded)
             if "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
             return df
-        return data
+        return decoded
 
     @with_retry
     async def delete_from_cache(
         self,
         symbol: str,
         interval: str,
+        *,
         prefix: Optional[str] = None,
     ) -> bool:
-        key = self._format_key(symbol, interval, prefix)
-        deleted = await self.client.delete(key)
-        logger.debug("[Redis][DEL] %s → %s", key, bool(deleted))
-        return bool(deleted)
+        key = self._key(symbol, interval, prefix)
+        res = await self.client.delete(key)
+        logger.debug("[Redis][DEL] %s → %s", key, bool(res))
+        return bool(res)
 
-    # ----------- інформаційні операції -----------
     @with_retry
     async def is_key_exists(
         self,
         symbol: str,
         interval: str,
+        *,
         prefix: Optional[str] = None,
     ) -> bool:
-        key = self._format_key(symbol, interval, prefix)
-        exists = await self.client.exists(key)
-        logger.debug("[Redis][EXISTS] %s → %s", key, bool(exists))
-        return bool(exists)
+        key = self._key(symbol, interval, prefix)
+        res = await self.client.exists(key)
+        logger.debug("[Redis][EXISTS] %s → %s", key, bool(res))
+        return bool(res)
 
     @with_retry
     async def get_remaining_ttl(
         self,
         symbol: str,
         interval: str,
+        *,
         prefix: Optional[str] = None,
     ) -> int:
-        """
-        Повертає TTL у секундах:
-        • >=0 – скільки залишилось;  
-        • -1  – безстроковий;  
-        • -2  – помилка.
-        """
-        key = self._format_key(symbol, interval, prefix)
+        key = self._key(symbol, interval, prefix)
         ttl = await self.client.ttl(key)
         logger.debug("[Redis][TTL] %s → %s", key, ttl)
         return ttl
 
-    # ----------- корисні утиліти -----------
-    @with_retry
-    async def ping(self) -> bool:
-        """Health‑check з’єднання (`PING`)."""
-        try:
-            pong = await self.client.ping()
-            logger.debug("[Redis][PING] → %s", pong)
-            return bool(pong)
-        except RedisError as exc:
-            logger.error("[Redis][PING] Error: %s", exc)
-            return False
-
-    async def close(self) -> None:
-        """Graceful‑shutdown: закриває клієнт і пул."""
-        await self.client.close()
-        await self.client.connection_pool.disconnect(inuse_connections=True)
-        logger.info("[Redis][CLOSE] Пул з’єднань закрито.")
-
-    # ----------- обгортки для роботи з Python‑об’єктами -----------
     async def set_json(
         self,
         symbol: str,
@@ -325,29 +291,74 @@ class SimpleCacheHandler:
         prefix: Optional[str] = None,
         ensure_ascii: bool = False,
     ) -> None:
-        """Серіалізує `obj` у JSON та кладе в кеш."""
+        """Convenience: JSON-dumps + store."""
         await self.store_in_cache(
             symbol,
             interval,
             json.dumps(obj, ensure_ascii=ensure_ascii),
             ttl=ttl,
             prefix=prefix,
+            raw=False,
         )
 
     async def get_json(
         self,
         symbol: str,
         interval: str,
+        *,
         prefix: Optional[str] = None,
     ) -> Optional[Any]:
-        """Повертає Python‑об’єкт, якщо у кеші збережено JSON."""
-        data = await self.fetch_from_cache(symbol, interval, prefix)
+        """Convenience: fetch + return dict|list or None."""
+        data = await self.fetch_from_cache(symbol, interval, prefix=prefix, raw=False)
         if isinstance(data, (dict, list)):
             return data
+        logger.warning("[Redis][GET_JSON] Unexpected type: %s", type(data))
         return None
 
-    # ─────────────────────── утиліти ───────────────────────
-    @staticmethod
-    def _format_key(symbol: str, interval: str, prefix: Optional[str]) -> str:
-        """Повертає ключ формату `prefix:symbol:interval` або `symbol:interval`."""
-        return f"{prefix}:{symbol}:{interval}" if prefix else f"{symbol}:{interval}"
+    @with_retry
+    async def ping(self) -> bool:
+        """Health check: PING."""
+        res = await self.client.ping()
+        logger.debug("[Redis][PING] → %s", res)
+        return bool(res)
+
+    async def close(self) -> None:
+        """Close connection pool."""
+        await self.client.close()
+        await self.client.connection_pool.disconnect(inuse_connections=True)
+        logger.debug("[Redis][CLOSE] Pool shut down.")
+
+
+    async def set_fast_symbols(
+        self,
+        symbols: list[str],
+        *,
+        ttl: int = DEFAULT_TTL
+    ) -> None:
+        """
+        Записує список string-символів у Redis як JSON (унікальний ключ).
+        """
+        if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+            raise ValueError("set_fast_symbols: symbols має бути списком рядків!")
+        val = json.dumps(symbols, ensure_ascii=False)
+        await self.client.set(self.FAST_SYMBOLS_KEY, val, ex=ttl)
+        logger.debug("[Redis][SET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols)
+
+    async def get_fast_symbols(self) -> list[str]:
+        """
+        Повертає список символів із Redis або [].
+        """
+        val = await self.client.get(self.FAST_SYMBOLS_KEY)
+        if not val:
+            logger.debug("[Redis][GET_FAST_SYMBOLS] Ключ %s відсутній!", self.FAST_SYMBOLS_KEY)
+            return []
+        try:
+            symbols = json.loads(val.decode() if isinstance(val, bytes) else val)
+        except Exception as e:
+            logger.warning("[Redis][GET_FAST_SYMBOLS] decode error: %s", e)
+            return []
+        if isinstance(symbols, list) and all(isinstance(s, str) for s in symbols):
+            logger.debug("[Redis][GET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols)
+            return symbols
+        logger.warning("[Redis][GET_FAST_SYMBOLS] Unexpected type: %r", type(symbols))
+        return []

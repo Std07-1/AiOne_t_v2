@@ -1,464 +1,554 @@
 # raw_data.py
+# -*- coding: utf-8 -*-
+"""
+AiOne_t • Data Fetcher (RAW)
+============================
+
+Асинхронний модуль для масового завантаження та кешування історичних свічок
+з Binance Futures API. Розроблено спеціально під AiOne_t з урахуванням:
+  • висока паралельність і back‑off‑повторення;
+  • спільний CacheHandler (Redis + файловий фелбек);
+  • ефективна серіалізація (JSON / LZ4 + orjson);
+  • детальне логування у форматі head:3\tail:3 на DEBUG‑рівні;
+  • готовність до інтеграції в pipeline «збір → валідація → підготовка».
+
+Швидкий огляд API
+-----------------
+>>> async with aiohttp.ClientSession() as sess:
+...     cache = CacheHandler(redis_url="rediss://…", ttl_default=3600)
+...     fetcher = OptimizedDataFetcher(cache_handler=cache, session=sess)
+...     data = await fetcher.get_data_batch(["BTCUSDT", "ETHUSDT"],
+...                                         interval="1h", limit=720)
+"""
+
+from __future__ import annotations
+import sys
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-import asyncio
+import orjson
 import pandas as pd
-import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-import json
-
-from monitor.asset_selector.utils import standardize_format, get_ttl_for_interval
+import rich.logging
+from lz4.frame import compress, decompress
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.progress import (
-    Progress, SpinnerColumn, BarColumn, TextColumn,
-    TimeElapsedColumn, TimeRemainingColumn
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
 )
 
-# Отримуємо логгер для модуля raw_data
+from .utils import get_ttl_for_interval
+
+# ───────────────────────────── ЛОГУВАННЯ ─────────────────────────────
 logger = logging.getLogger("raw_data")
 logger.setLevel(logging.INFO)
-
-# Налаштовуємо обробник через RichHandler для більш красивого форматування
-console = Console()
-rich_handler = RichHandler(console=console, level=logging.INFO, show_path=False)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-rich_handler.setFormatter(formatter)
+progress_console  = Console(file=sys.stderr)
+_handler = rich.logging.RichHandler(
+    console=progress_console,
+    show_level=True,
+    show_path=False,
+    markup=False,  # ← НЕ парсить розмітку!
+    rich_tracebacks=True,
+)
 if not logger.handlers:
-    logger.addHandler(rich_handler)
+    logger.addHandler(_handler)
 logger.propagate = False
 
-# Глобальний семафор на 10 паралельних завантажень
-SEMAPHORE = asyncio.Semaphore(25)
+# ──────────────────────────────── КОНСТАНТИ ───────────────────────────────
+BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_FUTURES_EXINFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-# ------------- constants ---------------------------------
-MAX_PARALLEL_KLINES = 10                    # одночасних REST‑запитів
+MAX_PARALLEL_KLINES = 10          # макс. одночасно REST‑запитів за свічками
 _KLINE_SEM = asyncio.Semaphore(MAX_PARALLEL_KLINES)
 
-async def fetch_with_retry(
-    session: aiohttp.ClientSession,
-    url: str,
-    params: dict = None,
-    max_retries: int = 3,
-    backoff_sec: float = 2.0,
-    timeout_sec: float = 10.0
-) -> str:
+# глобальний семафор для усіх інших REST‑викликів
+GLOBAL_SEMAPHORE = asyncio.Semaphore(25)
+
+# ───────────────────────────── допоміжні функції ────────────────────────────
+def _log_dataframe(df: pd.DataFrame, label: str) -> None:
+    """DEBUG‑знімок у форматі head:3\\tail:3 (економить простір у логах)."""
+    if logger.isEnabledFor(logging.DEBUG) and not df.empty:
+        snippet = pd.concat([df.head(3), df.tail(3)]).to_dict("records")
+        logger.debug("%s  head:3\\tail:3=%s", label, snippet)
+
+def _prepare_kline(df: pd.DataFrame, *, resample_to: str | None = None) -> pd.DataFrame:
     """
-    Виконує GET-запит із повторними спробами.
-    При помилках з'єднання / таймаутах / невдалих статусах
-    робимо до max_retries спроб із паузою backoff_sec.
-    Повертає text-респонс або піднімає виняток після вичерпання спроб.
-    """
-    for attempt in range(1, max_retries + 1):
-        try:
-            #logger.debug(f"[fetch_with_retry] Запит {url}, спроба={attempt}, params={params}")
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout_sec)
-            ) as resp:
-                text_resp = await resp.text()
-                if resp.status == 200:
-                    return text_resp
-                else:
-                    logger.warning(
-                        f"[fetch_with_retry] {url} (спроба={attempt}) => "
-                        f"статус={resp.status}, body={text_resp}"
-                    )
-        except (aiohttp.ClientConnectorError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
-            logger.warning(
-                f"[fetch_with_retry] {url} (спроба={attempt}) => "
-                f"Помилка з'єднання/таймаут: {e}"
-            )
-
-        if attempt < max_retries:
-            logger.debug(f"[fetch_with_retry] Очікуємо {backoff_sec:.1f} c перед повтором...")
-            await asyncio.sleep(backoff_sec)
-
-    # Якщо дійшли сюди - всі спроби провалилися
-    raise aiohttp.ClientError(f"[fetch_with_retry] Не вдалося отримати {url} після {max_retries} спроб.")
-
-
-def parse_futures_exchange_info(text_resp: str) -> dict:
-    """
-    Перетворює JSON-рядок від Binance (fapi/v1/exchangeInfo) на словник
-    формату {"symbols": [...]}, де 'symbols' – список інформації про пари.
-    """
-    try:
-        parsed = json.loads(text_resp)
-    except json.JSONDecodeError as e:
-        logger.error(f"[FUTURES EXCHANGE] JSON decode error: {e}")
-        return {"symbols": []}
-
-    # Перевіримо, чи є ключ 'symbols'
-    if "symbols" not in parsed or not isinstance(parsed["symbols"], list):
-        logger.warning("[FUTURES EXCHANGE] У відповіді немає поля 'symbols' або воно не є списком.")
-        return {"symbols": []}
-
-    # Формуємо DataFrame для логу
-    df_symbols = pd.DataFrame(parsed["symbols"])
-    logger.debug(f"[FUTURES EXCHANGE] Знайдено {len(df_symbols)} символ(ів).")
-
-    # Повертаємо словник зі списком символів
-    return {"symbols": df_symbols.to_dict("records")}
-
-# ───────────────────────────── helper ─────────────────────────────
-def _prepare_kline(
-    df: pd.DataFrame,
-    *,
-    resample_to: str | None = None,        # напр. "1h", "4h" або None
-) -> pd.DataFrame:
-    """
-    • Приводить dtypes (float32) → економія RAM  
-    • За потреби агрегує дрібні свічки у більший таймфрейм.
+    Підготовка DataFrame:
+      • конвертація OHLCV → float32 (‑50% RAM),
+      • timestamp → UTC tz‑aware,
+      • за потреби ресемпл (наприклад, "1m" → "1h").
     """
     if df.empty:
         return df
 
-    # -- 1. memory friendly dtypes ---------------------------------
     df = df.astype({
-        "open":   "float32",
-        "high":   "float32",
-        "low":    "float32",
-        "close":  "float32",
-        "volume": "float32",
+        "open": "float32", "high": "float32",
+        "low": "float32",  "close": "float32",
+        "volume": "float32"
     })
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
-    # -- 2. optional resample --------------------------------------
     if resample_to:
-        df = (
-            df.set_index("timestamp")
-              .resample(resample_to, label="right", closed="right")
-              .agg({
-                  "open":  "first",
-                  "high":  "max",
-                  "low":   "min",
-                  "close": "last",
-                  "volume":"sum",
-              })
-              .dropna()
-              .reset_index()
-        )
+        df = (df.set_index("timestamp")
+                .resample(resample_to, label="right", closed="right")
+                .agg({
+                    "open": "first", "high": "max",
+                    "low": "min",   "close": "last",
+                    "volume": "sum"
+                })
+                .dropna()
+                .reset_index())
     return df
 
+def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
+    """
+    Серіалізація DataFrame → bytes через orjson (з опційним LZ4‑стисненням).
+    Timestamp (datetime) → int64 ms для JS‑дружнього формату.
+    """
+    df_out = df.copy()
+    if "timestamp" in df_out.columns and pd.api.types.is_datetime64_any_dtype(df_out["timestamp"]):
+        df_out["timestamp"] = (df_out["timestamp"].astype("int64") // 1_000_000).astype("int64")
+    raw_json = orjson.dumps(df_out.to_dict(orient="split"))
+    return compress(raw_json) if compress_lz4 else raw_json
 
+def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
+    """
+    Десеріалізація bytes/str → DataFrame.
+    Якщо compressed=True, виконуємо LZ4‑декомпресію.
+    Перетворюємо timestamp (int64 ms) → datetime UTC.
+    """
+    try:
+        raw = buf.encode() if isinstance(buf, str) else buf
+        if compressed:
+            raw = decompress(raw)
+        obj = orjson.loads(raw)
+        df = pd.DataFrame(**obj)
+        if "timestamp" in df.columns and pd.api.types.is_integer_dtype(df["timestamp"]):
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+    except Exception as e:
+        raise ValueError(f"Не вдалося розпакувати DataFrame: {e}") from e
+
+# ───────────────────────── network primitives ──────────────────────────
+async def fetch_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: Optional[Dict[str, str]] = None,
+    max_retries: int = 3,
+    backoff_sec: float = 2.0,
+    timeout_sec: float = 10.0,
+) -> str:
+    """
+    GET із back‑off‑повторенням та логуванням. Після max_retries кидає ClientError.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.get(url, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    return text
+                logger.warning("[fetch_with_retry] %s (спроба=%d) => HTTP %d, body=%s",
+                               url, attempt, resp.status, text[:200])
+        except (aiohttp.ClientConnectorError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as err:
+            logger.warning("[fetch_with_retry] %s (спроба=%d) => %s", url, attempt, err)
+        if attempt < max_retries:
+            await asyncio.sleep(backoff_sec)
+    raise aiohttp.ClientError(f"Не вдалося отримати {url} після {max_retries} спроб.")
+
+def parse_futures_exchange_info(text: str) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Парсер JSON для exchangeInfo → {"symbols":[...]}.
+    Навіть якщо поле відсутнє, повертає {"symbols":[]}.
+    """
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error("[FUTURES EXCHANGE] Помилка JSON: %s", e)
+        return {"symbols": []}
+
+    symbols = parsed.get("symbols")
+    if not isinstance(symbols, list):
+        logger.warning("[FUTURES EXCHANGE] Поле 'symbols' відсутнє або некоректне.")
+        return {"symbols": []}
+
+    df = pd.DataFrame(symbols)
+    logger.debug("[FUTURES EXCHANGE] Знайдено %d символів.", len(df))
+    return {"symbols": df.to_dict("records")}
+
+# ────────────────────── Основний клас ─────────────────────────────
 class OptimizedDataFetcher:
+    """
+    Аcинхронне вантаження OHLCV з кешем і інкрементом.
+
+    Параметри:
+      • cache_handler : Redis + fallback
+      • session       : aiohttp.ClientSession
+      • compress_cache: чи стискати LZ4 (за замовчуванням True)
+    """
+
     def __init__(
         self,
+        *,
         cache_handler,
         session: aiohttp.ClientSession,
-        binance_api_url: str = "https://api.binance.com"
+        compress_cache: bool = True,
     ):
-        """
-        :param cache_handler: об'єкт для кешування (SimpleCacheHandler).
-        :param session:       уже створений aiohttp.ClientSession (shared).
-        :param binance_api_url: рядок, напр. "https://api.binance.com" (для Spot).
-        """
         self.cache_handler = cache_handler
         self.session = session
-        self.binance_api_url = binance_api_url
+        self.compress_cache = compress_cache
+
+    # ───────────────────── Пакетне отримання ───────────────────────────
+    async def get_data_batch(
+        self,
+        symbols: List[str],
+        *,
+        interval: str = "1d",
+        limit: int = 500,
+        min_candles: int = 24,
+        read_cache: bool = True,
+        write_cache: bool = True,
+        show_progress: bool = False,           # ← новий параметр
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Паралельне завантаження до MAX_PARALLEL_KLINES символів.
+        Якщо show_progress=True — рендерить плавний Rich Progress.
+        Повертає dict{symbol: DataFrame}.
+        """
+        total = len(symbols)
+        results: Dict[str, pd.DataFrame] = {}
+        start = time.perf_counter()
+
+        # Вибір контексту для прогрес‑бару
+        if show_progress:
+            prog_ctx = Progress(
+                SpinnerColumn(),                                                 # ⠙ спінер
+                BarColumn(bar_width=30),                                         # ━╸━━━━
+                TextColumn("[cyan]Завантаження даних… {task.completed}/{task.total}"),
+                TimeElapsedColumn(),                                             # 0:00:03
+                console=progress_console,
+                transient=True,
+                refresh_per_second=4,
+            )
+        else:
+            # "Пустий" прогрес без візуалізації
+            class DummyProgress:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def add_task(self, *a, **k): return None
+                def advance(self, *a, **k): pass
+                def update(self, *a, **k): pass
+
+            prog_ctx = DummyProgress()
+
+        # Виконуємо пакетне завантаження
+        with prog_ctx as prog:
+            task_id = prog.add_task("Завантаження даних…", total=total)
+            tasks = [
+                asyncio.create_task(
+                    self._worker_for_symbol(
+                        sym, interval, limit, min_candles,
+                        read_cache=read_cache, write_cache=write_cache
+                    )
+                )
+                for sym in symbols
+            ]
+            for fut in asyncio.as_completed(tasks):
+                sym, df = await fut
+                prog.update(task_id, description=f"Завантаження [{sym}]")
+                prog.advance(task_id, 1)
+                if df is not None and not df.empty:
+                    results[sym] = df
+
+        elapsed = time.perf_counter() - start
+        logger.info("[BATCH] %d/%d символів готово за %.2f с.",
+                    len(results), total, elapsed)
+        return results
 
     async def _worker_for_symbol(
         self,
         symbol: str,
         interval: str,
         limit: int,
-        min_candles: int
-    ) -> tuple[str, Optional[pd.DataFrame]]:
-        """
-        Допоміжна функція, що виконує завантаження даних для окремого символу з обмеженням паралелізму.
-        """
+        min_candles: int,
+        *,
+        read_cache: bool,
+        write_cache: bool,
+    ) -> Tuple[str, Optional[pd.DataFrame]]:
         async with _KLINE_SEM:
-            df = await self.get_data(symbol, interval, limit, min_candles)
-            return symbol, df
+            df = await self.get_data(
+                symbol, interval, limit=limit, min_candles=min_candles,
+                read_cache=read_cache, write_cache=write_cache
+            )
+        return symbol, df
 
-    async def get_data_batch(
-        self,
-        symbols: list[str],
-        interval: str = "1d",
-        limit: int = 24,
-        min_candles: int = 24
-    ) -> dict[str, pd.DataFrame]:
-        """
-        Повертає dict {symbol: DataFrame} для списку symbols.
-        Використовується комбінований індикатор завантаження з розширеним прогрес-баром,
-        який показує spinner, стрічку прогресу, відсоток, час виконання, очікуваний час до завершення,
-        а також динамічне повідомлення з останнім оброблюваним символом.
-        Оновлення опису відбувається кожного batch_size завдань.
-        """
-        total = len(symbols)
-        results = {}
-        start_time = asyncio.get_event_loop().time()
-        batch_size = 10  # оновлювати опис кожні 10 завдань
-
-        with Progress(
-            SpinnerColumn(spinner_name="dots"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("Останній: {task.description}"),
-            console=console,
-            transient=True,
-        ) as progress:
-            task_id = progress.add_task("Обробка символів...", total=total)
-            i = 0
-            tasks = [
-                asyncio.create_task(self._worker_for_symbol(sym, interval, limit, min_candles))
-                for sym in symbols
-            ]
-            for future in asyncio.as_completed(tasks):
-                sym, df = await future
-                i += 1
-                progress.advance(task_id, 1)
-                # Якщо завершено batch_size завдань або це останнє завдання — оновлюємо опис із розрахунком часу
-                if i % batch_size == 0 or i == total:
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    avg_time = elapsed / i if i else 0
-                    remaining = avg_time * (total - i)
-                    progress.update(
-                        task_id,
-                        description=f"[bold green]{sym}[/bold green] | ≈ {remaining:.1f} сек"
-                    )
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    results[sym] = df
-        return results
-
-    
+    # ───────────────────── Односерійне отримання ───────────────────────
     async def get_data(
         self,
         symbol: str,
         interval: str,
+        *,
         limit: int = 1000,
-        min_candles: int = 24  # мінімально потрібна кількість свічок
+        min_candles: int = 24,
+        read_cache: bool = True,
+        write_cache: bool = True,
     ) -> Optional[pd.DataFrame]:
         """
-        1) Читає кеш (якщо є).
-        2) Якщо дані актуальні -> інкрементальне оновлення.
-        3) Якщо застарілі/немає -> повне завантаження + збереження.
-        4) Перевірка на достатню кількість свічок.
+        Основний метод: кеш → інкремент → повне REST.
+        Після повернення гарантує len(df) >= min_candles.
         """
-        max_age_seconds = get_ttl_for_interval(interval)
-        cache_key_prefix = "candles"
+        ttl = get_ttl_for_interval(interval)
+        prefix = "candles"
 
-        # Отримуємо дані з кешу
-        df_cached = await self.cache_handler.fetch_from_cache(
-            symbol, interval, prefix=cache_key_prefix
-        )
-
-        # Зменшуємо dtypes + resample ДЛЯ df_cached
-        if isinstance(df_cached, pd.DataFrame) and not df_cached.empty:
-            df_cached = _prepare_kline(
-                df_cached,
-                resample_to=interval if interval.endswith("m") else None,
+        # 1) Спроба зчитати з кешу
+        df_cached: Optional[pd.DataFrame] = None
+        if read_cache:
+            raw = await self.cache_handler.fetch_from_cache(
+                symbol, interval, prefix=prefix, raw=True
             )
+            if raw is not None:
+                try:
+                    df_cached = _bytes_to_df(raw, compressed=self.compress_cache)
+                    df_cached = _prepare_kline(df_cached)
+                except ValueError:
+                    logger.warning("[CACHE] Пошкоджений кеш %s:%s — ігноруємо.", symbol, interval)
 
-        if df_cached is not None:
-            df_cached = standardize_format(df_cached, timezone="UTC")
-
-            if self._is_data_actual(df_cached, max_age_seconds, interval):
-                logger.debug(
-                    f"[GET_DATA] Кеш актуальний для {symbol} ({interval}). "
-                    "Інкрементальне оновлення."
-                )
-                df_updated = await self._incremental_update(
-                    symbol, interval, df_cached, cache_key_prefix, max_age_seconds
-                )
-
-                # Перевірка після інкрементального оновлення
-                if len(df_updated) < min_candles:
-                    logger.info(
-                        f"[{symbol}] Недостатньо історичних даних після оновлення ({len(df_updated)} свічок)."
-                    )
-                    return None
-
-                return df_updated
-
-        # Якщо даних немає в кеші або застарілі — отримуємо повні дані
-        logger.debug(f"[GET_DATA] Повне завантаження {symbol} ({interval}).")
-        df_full = await self._fetch_binance_data(symbol, interval, limit)
-        
-        # Приводимо dtypes + optional resample ДЛЯ df_full
-        if df_full is not None and not df_full.empty:
-            df_full = _prepare_kline(
-                df_full,
-                resample_to=interval if interval.endswith("m") else None,
+        # 2) Якщо кеш актуальний → інкрементальний апдейт
+        if df_cached is not None and self._is_data_actual(df_cached, ttl, interval):
+            updated = await self._incremental_update(
+                symbol, interval, df_cached,
+                ttl=ttl, cache_prefix=prefix, write_cache=write_cache
             )
+            if len(updated) >= min_candles:
+                return updated
 
-        if df_full is None or len(df_full) < min_candles:
-            logger.warning(
-                f"[{symbol}] Недостатньо історичних даних для аналізу ({len(df_full) if df_full is not None else 0} свічок)."
-            )
+        # 3) Інакше — повне REST‑завантаження
+        df_full = await self._fetch_binance_data(symbol, interval, limit=limit)
+        if df_full.empty or len(df_full) < min_candles:
+            logger.warning(f"[{symbol}][{interval}] недостатньо свічок ({len(df_full)}).")
+
             return None
 
-        await self.cache_handler.store_in_cache(
-            symbol=symbol,
-            interval=interval,
-            data_json=df_full.to_json(orient="records", date_format="iso"),
-            ttl=max_age_seconds,
-            prefix=cache_key_prefix
-        )
+        df_full = _prepare_kline(df_full)
+        #_log_dataframe(df_full, f"[FULL]{symbol}:{interval}")
 
+        if write_cache:
+            await self.cache_handler.store_in_cache(
+                symbol, interval,
+                _df_to_bytes(df_full, compress_lz4=self.compress_cache),
+                ttl=ttl, prefix=prefix, raw=True
+            )
         return df_full
 
+    # ─────────────────── Інкрементальний апдейт ───────────────────────
     async def _incremental_update(
         self,
         symbol: str,
         interval: str,
         df_cached: pd.DataFrame,
-        cache_key_prefix: str,
-        ttl: int
+        *,
+        ttl: int,
+        cache_prefix: str,
+        write_cache: bool,
     ) -> pd.DataFrame:
-        """
-        Завантажує нові свічки після останньої мітки (timestamp), оновлює Redis.
-        """
-        last_cached_timestamp = df_cached["timestamp"].max()
-        last_ts = int(last_cached_timestamp.timestamp() * 1000) + 1
-
-        df_new = await self._fetch_binance_data(symbol, interval, limit=1000, start_time=last_ts)
+        # Останній відомий timestamp + 1 мс
+        last_ts_ms = int(df_cached["timestamp"].max().timestamp() * 1000) + 1
+        # ① отримуємо «чистий» DataFrame з int‑timestamp
+        df_new = await self._fetch_binance_data(
+            symbol, interval, limit=1000, start_time=last_ts_ms
+        )
         if df_new.empty:
-            logger.debug(f"[INCREMENTAL] {symbol} ({interval}) немає нових даних.")
+            # немає нових свічок
             return df_cached
+        
+        # ② Приводимо нові свічки у той же формат, що й full‑завантаження:
+        #    конвертує _timestamp_→datetime, float32, тощо
+        df_new = _prepare_kline(df_new)
 
-        df_merged = (
+        df_all = (
             pd.concat([df_cached, df_new])
-            .drop_duplicates(subset="timestamp")
-            .sort_values("timestamp")
-            .reset_index(drop=True)
+              .drop_duplicates(subset="timestamp")
+              .sort_values("timestamp")
+              .reset_index(drop=True)
         )
+        #_log_dataframe(df_all, f"[INCR]{symbol}:{interval}")
 
-        await self.cache_handler.store_in_cache(
-            symbol, interval,
-            data_json=df_merged.to_json(orient="records", date_format="iso"),
-            ttl=ttl, prefix=cache_key_prefix
-        )
-        logger.debug(f"[INCREMENTAL] Інкрементальне оновлення {symbol} ({interval}) завершено.")
-        return df_merged
+        if write_cache:
+            await self.cache_handler.store_in_cache(
+                symbol, interval,
+                _df_to_bytes(df_all, compress_lz4=self.compress_cache),
+                ttl=ttl, prefix=cache_prefix, raw=True
+            )
+        return df_all
 
+    # ───────────────────── REST‑запит до Binance ─────────────────────────
     async def _fetch_binance_data(
         self,
         symbol: str,
         interval: str,
+        *,
         limit: int,
-        start_time: Optional[int] = None
+        start_time: Optional[int] = None,
     ) -> pd.DataFrame:
         """
-        Завантаження даних із Binance Futures (fapi).
-        Тут використовуємо одну session + Semaphore + retry.
+        Безпосередньо йде на /fapi/v1/klines.
+        Додано перевірку символу: тільки USDT‑контракти.
         """
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        # Підтримуємо і lower-, і UPPER-case: для API потрібен uppercase
+        sym_api = symbol.upper()
+        if not sym_api.endswith("USDT"):
+            logger.error("[FETCH] Невалідний символ: %s — можливо, не USDT‑Futures", symbol)
+            return pd.DataFrame()
+
+        # Формуємо запит до Binance із UPPER‑case
+        params: Dict[str, str | int] = {
+            "symbol": sym_api,
+            "interval": interval,
+            "limit": limit,
+        }
         if start_time:
             params["startTime"] = start_time
 
-        # Обмежуємо паралелізм
-        async with SEMAPHORE:
-            text_resp = await fetch_with_retry(
-                session=self.session,
-                url=url,
-                params=params,
-                max_retries=3,
-                backoff_sec=2.0,
-                timeout_sec=10.0
+        async with GLOBAL_SEMAPHORE:
+            text = await fetch_with_retry(
+                self.session, BINANCE_FUTURES_KLINES, params=params
             )
-
-        # Тепер manually parse JSON -> DataFrame
         try:
-            parsed = json.loads(text_resp)
-        except json.JSONDecodeError as e:
-            logger.error(f"[FETCH] JSON decode error для {symbol} ({interval}): {e}")
+            parsed: List[List] = json.loads(text)
+        except json.JSONDecodeError:
+            logger.error("[FETCH] Помилка JSON для %s %s.", symbol, interval)
+            return pd.DataFrame()
+        if not parsed:
             return pd.DataFrame()
 
-        # parsed – це список списків (klines)
-        if not parsed or not isinstance(parsed, list):
-            logger.debug(f"[FETCH] Порожній або некоректний респонс для {symbol} ({interval}).")
-            return pd.DataFrame()
-
-        # Створюємо DataFrame
         columns = [
             "timestamp", "open", "high", "low", "close", "volume",
             "close_time", "quote_asset_volume", "trades",
             "taker_buy_base", "taker_buy_quote", "ignore"
         ]
         df = pd.DataFrame(parsed, columns=columns)
-        if df.empty:
-            logger.debug(f"[FETCH] Порожній DF після перетворення для {symbol} ({interval}).")
-            return df
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
 
-        # Конвертуємо timestamp і числові поля
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-        df[numeric_cols] = df[numeric_cols].astype(float)
+        logger.debug("[FETCH] %s %s — отримано %d рядків.", symbol, interval, len(df))
+        return df
 
-        logger.debug(
-            f"[FETCH] Отримано {len(df)} свічок для {symbol} ({interval}) з Binance."
-        )
-        return df[["timestamp", "open", "high", "low", "close", "volume"]]
+    # ───────────────────── перевірка «свіжості» кеша ──────────────────────
+    @staticmethod
+    def _is_data_actual(df: pd.DataFrame, max_age_sec: int, interval: str) -> bool:
+        """
+        Перевіряє, наскільки давня остання свічка.
+        Для '1d' після півночі UTC вимагає повного оновлення.
+        Інакше max_age_sec.
+        """
+        now = datetime.now(timezone.utc)
+        last_ts = df["timestamp"].max()
+        if interval == "1d" and OptimizedDataFetcher._after_midnight_utc():
+            return False
+        age = (now - last_ts).total_seconds()
+        status = "АКТУАЛЬНИЙ ✅" if age < max_age_sec else "ЗАСТАРІЛИЙ ❌"
+        logger.debug("[TTL] %s last=%s age=%.0fs max=%ds %s",
+                     interval, last_ts.strftime("%Y-%m-%d %H:%M:%S"), age, max_age_sec, status)
+        return age < max_age_sec
 
     @staticmethod
-    def after_midnight_utc() -> bool:
+    def _after_midnight_utc() -> bool:
+        """True, якщо зараз 00:00–00:05 UTC (після півночі)."""
+        now = datetime.now(timezone.utc)
+        return now.hour == 0 and now.minute < 5
+
+    # ───────────────────────── exchangeInfo ─────────────────────────────
+    async def get_futures_exchange_info(self) -> Dict[str, List[Dict[str, str]]]:
         """
-        Чи час у UTC у проміжку 00:00..00:05 => для примусового оновлення daily.
+        Повертає справжню інформацію про ф’ючерсні контракти (USDT‑M) з кешу або REST.
         """
-        now_utc = datetime.now(timezone.utc)
-        return now_utc.hour == 0 and now_utc.minute < 5
+        txt = await fetch_with_retry(self.session, BINANCE_FUTURES_EXINFO,
+                                     max_retries=2, timeout_sec=5.0)
+        return parse_futures_exchange_info(txt)
 
-    def _is_data_actual(self, df: pd.DataFrame, max_age_seconds: int, interval: str) -> bool:
-        """
-        Якщо '1d' та після опівночі => False;
-        інакше порівнює (now_utc - останній timestamp) з max_age_seconds.
-        """
-        last_ts = df["timestamp"].max()
-        current_time_utc = datetime.now(timezone.utc)
 
-        # Для інтервалу 1d та після опівночі
-        if interval == "1d" and self.after_midnight_utc():
-            logger.debug("[AFTER_MIDNIGHT] Примусове оновлення (00:00..00:05 UTC).")
-            return False
 
-        age_seconds = (current_time_utc - last_ts).total_seconds()
-        age_td = timedelta(seconds=age_seconds)
-        actual = age_seconds < max_age_seconds
-        max_age_td = timedelta(seconds=max_age_seconds)
+"""
+ Поточний шлях отримання даних (історія + інкременти)
+                               
 
-        status_str = "OK ✅" if actual else "EXPIRED ❌"
-        last_ts_str = last_ts.strftime('%Y-%m-%d %H:%M:%S %Z')
+            ┌───────────────┐
+request →   │  DataFetcher  │   get_data(...)        (async/await)
+            └───────────────┘
+                     │
+                     ▼
+          ┌────────────────────┐   ①   cache_handler.fetch_from_cache(raw=True)
+          │      Redis         │───────────────┐
+          └────────────────────┘               │
+                     │                         │  LZ4‑bytes  (90 % випадків)
+     cache miss / expired                      │
+                     │                         │
+                     ▼                         │
+            ②  REST‑API  (fapi/binance)        │
+                     │                         │
+                     ▼                         │
+          ┌────────────────────┐   ③   cache_handler.store_in_cache(..., raw=True)
+          │      Redis         │◀──────────────┘
+          └────────────────────┘
+                     │
+                     ▼
+               DataFrame → скринер / індикатори
 
-        logger.debug(
-            f"Перевірка актуальності кешу:\n"
-            f"  ├─ Остання мітка      : {last_ts_str}\n"
-            f"  ├─ Вік даних          : {str(age_td)} ({age_seconds:.1f} сек)\n"
-            f"  ├─ Макс. допустимий   : {str(max_age_td)} ({max_age_seconds} сек)\n"
-            f"  └─ Актуальні          : {actual} ({status_str})"
-        )
-        return actual
 
-    async def get_exchange_info(self) -> dict:
-        """
-        Спотова exchangeInfo (не обов'язково), якщо треба.
-        """
-        endpoint = f"{self.binance_api_url}/api/v3/exchangeInfo"
-        text_resp = await fetch_with_retry(self.session, endpoint, max_retries=2, timeout_sec=5.0)
 
-        # parse json
-        try:
-            parsed = json.loads(text_resp)
-        except json.JSONDecodeError:
-            logger.error("[SPOT EXCHANGE] JSON decode error.")
-            return {}
-        logger.debug("[SPOT EXCHANGE] exchangeInfo (spot) завантажено.")
-        return parsed
+ Архітектура з урахуванням нового cache_handler
 
-    async def get_futures_exchange_info(self) -> dict:
-        """
-        Завантажує і парсить Binance Futures exchangeInfo, повертає словник {"symbols": [...]}
-        """
-        futures_api = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-        text_resp = await fetch_with_retry(self.session, futures_api, max_retries=2, timeout_sec=5.0)
-        parsed_info = parse_futures_exchange_info(text_resp)
+┌───────────────┐  wss://…@kline_1m  ┌───────────────────────────────┐
+│ Binance WS    │──────────────────▶│  stream_worker.py (task)      │
+└───────────────┘                   └────────────┬───────────────────┘
+                                                ①│  CacheHandler.store_in_cache(
+                                                 │     symbol, "1m",
+                                                 │     raw_bytes, ttl=90,
+                                                 │     prefix="candles",
+                                                 │     publish_channel="klines.1m.tick"
+                                                 │ )
+                                                ②│  if kline["x"]:  # final 1m
+                                                 │        aggregate_hourly() →
+                                                 │        store "1h" (ttl=3900)
+                                                 │        publish "klines.1h.update"
+                                                 ▼
+                               ┌───────────────────────────────┐
+                               │              Redis            │
+                               └───────────────────────────────┘
+                                                ▲
+                                                │
+                DataFetcher.get_data(read_cache=True) ── ③ fetch_from_cache(raw=True)
 
-        logger.debug("[FUTURES EXCHANGE] Отримано exchangeInfo. "
-                     f"symbols={len(parsed_info.get('symbols', []))}")
-        return parsed_info
+
+ Поточний data‑flow у AiOne_t (після всіх патчів)
+
+REST‑коли потрібно        ┌──────────────────────────┐
+┌─────────────┐            │  OptimizedDataFetcher   │
+│ Binance REST│───┐        └────────────┬───────────┘
+└─────────────┘   │ ③ full / incr JSON/LZ4          ▲
+                  ▼                                 │
+   ② SETEX (raw) + PUBLISH    ① GET (raw)           │
+┌────────────────────────────────────────────────────┼──────────┐
+│                     Redis                          │          │
+│  key = candles:{symbol}:{tf}  |  TTL  90 s (1m)    │          │
+│                               |       3900 s (1h)  │          │
+└────────────────────────────────────────────────────┴──────────┘
+                  ▲                                 │
+                  │  publish "klines.1h.update"     │
+┌──────────────┐  │                                 │
+│ stream_worker│──┘                                 ▼
+│  (Binance WS)│          скринер / індикатори / trigger‑logic
+└──────────────┘
+                
+                
+"""
+                

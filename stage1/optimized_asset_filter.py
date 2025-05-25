@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import timedelta
 from typing import Dict, List, Tuple
 
 import aiohttp
@@ -36,6 +35,7 @@ from tenacity import (
 from aiohttp import ClientResponseError
 
 logger = logging.getLogger("optimized_asset_filter")
+logger.setLevel(logging.INFO)
 
 # --------------------------------------------------------------------------- #
 #                               ── CONSTANTS ──                               #
@@ -185,7 +185,7 @@ async def _fetch_exchange_info(cache_handler, session) -> list[dict]:
     await cache_handler.store_in_cache(
         symbol=key,
         interval="global",
-        data_json=json.dumps(validated),
+        data=json.dumps(validated),
         ttl=3 * 3600,
         prefix="meta"
     )
@@ -291,8 +291,8 @@ async def quick_absolute_filter(
     elif len(final) < p.max_symbols:
         logger.info("Знайдено лише %d із %d запитуваних символів.",
                     len(final), p.max_symbols)
-    else:
-        logger.debug("Фінальний список: %s", final)
+    #else:
+        #logger.debug("Фінальний список: %s", final)
 
     return final
 
@@ -315,7 +315,7 @@ async def get_prefiltered_symbols(
     ...         "MIN_QUOTE_VOLUME": 1_500_000,
     ...         "MIN_PRICE_CHANGE": 2.5,
     ...         "MIN_OPEN_INTEREST": 600_000,
-    ...         "MAX_SYMBOLS": 80,
+    ...         "MAX_SYMBOLS": MAX,
     ...     }, dynamic=False
     ... )
     """
@@ -323,7 +323,7 @@ async def get_prefiltered_symbols(
         min_quote_volume=thresholds.get("MIN_QUOTE_VOLUME", 1_000_000.0),
         min_price_change=thresholds.get("MIN_PRICE_CHANGE", 3.0),
         min_open_interest=thresholds.get("MIN_OPEN_INTEREST", 500_000.0),
-        max_symbols=int(thresholds.get("MAX_SYMBOLS", 80)),
+        max_symbols=int(thresholds.get("MAX_SYMBOLS", 400)),
         dynamic=dynamic,
     )
     return await quick_absolute_filter(
@@ -331,6 +331,7 @@ async def get_prefiltered_symbols(
         cache_handler=cache_handler,
         params=params,
     )
+
 
 
 

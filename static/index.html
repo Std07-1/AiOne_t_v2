@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="ua">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>AiOne Dashboard</title>
+    <!-- TradingView скрипт -->
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <style>
+        /* ───── Reset & базові стилі ───── */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body,
+        html {
+            height: 100%;
+            width: 100%;
+            font-family: sans-serif;
+            background: #0e1017;
+            color: #eee;
+            overflow: hidden;
+        }
+
+        body {
+            display: flex;
+        }
+
+        /* ───── Сітка ───── */
+        #sidebar {
+            width: 280px;
+            background: #131620;
+            border-right: 1px solid #272b33;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        #content {
+            flex: 1;
+            padding: 1rem;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        /* ───── Фільтри ───── */
+        .filters {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .filters button {
+            background: #1e2128;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: background .2s;
+        }
+
+        .filters button.active,
+        .filters button:hover {
+            background: #272b33;
+        }
+
+        /* ───── Карточка активу ───── */
+        .asset {
+            position: relative;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid #272b33;
+            cursor: pointer;
+            transition: background .3s, transform .1s;
+        }
+
+        .asset:hover {
+            transform: translateY(-2px);
+        }
+
+        .asset.selected {
+            background: #272b33;
+        }
+
+        .asset-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .asset-symbol {
+            font-weight: bold;
+            font-size: 1.1rem;
+            color: #7aa2f7;
+        }
+
+        .asset-price {
+            font-size: 1.1rem;
+            min-width: 80px;
+            text-align: right;
+        }
+
+        .asset-change {
+            margin-left: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .up {
+            color: #3bbf7b;
+        }
+
+        .down {
+            color: #f7768e;
+        }
+
+        .asset-badge {
+            margin-left: 0.5rem;
+            cursor: help;
+            font-size: 1rem;
+        }
+
+        .asset-score {
+            height: 6px;
+            border-radius: 3px;
+            background: #272b33;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+
+        .asset-score>div {
+            height: 100%;
+            background: linear-gradient(90deg, #3bbf7b, #7aa2f7);
+            transition: width .3s;
+        }
+
+        .tv-sparkline {
+            margin-top: 6px;
+        }
+
+        .asset-hint {
+            margin-top: 4px;
+            font-size: 0.75rem;
+            color: #8a8f99;
+        }
+
+        /* ───── Панель деталей ───── */
+        #detail {
+            background: #1e2128;
+            padding: 1rem;
+            border-radius: 4px;
+            display: none;
+        }
+
+        #detail h2 {
+            margin-bottom: 0.5rem;
+            color: #7aa2f7;
+        }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.4rem 0;
+            border-bottom: 1px solid #272b33;
+        }
+
+        .detail-row:last-child {
+            border-bottom: none;
+        }
+
+        .detail-key {
+            color: #8a8f99;
+        }
+
+        .detail-value {
+            text-align: right;
+        }
+
+        /* ───── ТВ-графік в деталях ───── */
+        #tv_chart {
+            width: 100%;
+            height: 400px;
+            margin-bottom: 1rem;
+        }
+
+        /* ───── Кнопка налаштувань ───── */
+        #settings-btn {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            background: #1e2128;
+            border: none;
+            padding: 0.5rem;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        /* ───── Модальне вікно налаштувань ───── */
+        #settings-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        #settings-content {
+            background: #1e2128;
+            padding: 1.5rem;
+            border-radius: 5px;
+            width: 300px;
+        }
+
+        #settings-content h3 {
+            margin-bottom: 1rem;
+        }
+
+        .setting-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .setting-item label {
+            flex: 1;
+            cursor: pointer;
+        }
+
+        .setting-item input[type="range"] {
+            width: 60px;
+            margin-left: 0.5rem;
+        }
+
+        #settings-actions {
+            text-align: right;
+            margin-top: 1rem;
+        }
+
+        #settings-actions button {
+            background: #272b33;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-left: 0.5rem;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Сайдбар -->
+    <div id="sidebar">
+        <div class="filters">
+            <button data-filter="all" class="active">All</button>
+            <button data-filter="hot">🔥 Hot</button>
+            <button data-filter="rsi">RSI↑</button>
+        </div>
+        <!-- Card list -->
+    </div>
+
+    <!-- Основний контент -->
+    <div id="content">
+        <button id="settings-btn" title="Налаштувати пріоритет">⚙️</button>
+        <h1>Моніторинг активів</h1>
+        <div id="last-updated" style="margin-bottom:1rem; font-size:0.9rem; color:#8a8f99;"></div>
+        <!-- TradingView Chart -->
+        <div id="tv_chart"></div>
+        <div id="detail"></div>
+    </div>
+
+    <!-- Модалка налаштувань -->
+    <div id="settings-modal">
+        <div id="settings-content">
+            <h3>Критерії пріоритету</h3>
+            <!-- перебір ключів -->
+            <div class="setting-item">
+                <input type="checkbox" id="f_rsi"><label for="f_rsi">RSI</label>
+                <input type="range" id="w_rsi" min="0" max="100">
+            </div>
+            <div class="setting-item">
+                <input type="checkbox" id="f_open_interest"><label for="f_open_interest">Open Interest</label>
+                <input type="range" id="w_open_interest" min="0" max="100">
+            </div>
+            <div class="setting-item">
+                <input type="checkbox" id="f_price_change"><label for="f_price_change">Price Change</label>
+                <input type="range" id="w_price_change" min="0" max="100">
+            </div>
+            <div class="setting-item">
+                <input type="checkbox" id="f_volume_z"><label for="f_volume_z">Vol Z</label>
+                <input type="range" id="w_volume_z" min="0" max="100">
+            </div>
+            <div class="setting-item">
+                <input type="checkbox" id="f_correlation"><label for="f_correlation">Correlation</label>
+                <input type="range" id="w_correlation" min="0" max="100">
+            </div>
+            <div id="settings-actions">
+                <button id="cancel-settings">Скасувати</button>
+                <button id="save-settings">Зберегти</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ───── Глобальні змінні ─────
+        let assets_data = [], settings = {};
+        const sidebar = document.getElementById('sidebar');
+        const detail = document.getElementById('detail');
+        const last_up = document.getElementById('last-updated');
+
+        // ───── Завантаження/збереження налаштувань ─────
+        function load_settings() {
+            const s = localStorage.getItem('priority_settings');
+            if (s) settings = JSON.parse(s);
+            else settings = {
+                rsi: 20, open_interest: 20, price_change: 20, volume_z: 20, correlation: 20,
+                enabled: { rsi: true, open_interest: true, price_change: true, volume_z: true, correlation: true }
+            };
+        }
+        function save_settings() {
+            localStorage.setItem('priority_settings', JSON.stringify(settings));
+        }
+
+        // ───── Обчислення score ─────
+        function compute_score(a) {
+            let total = 0, sumw = 0;
+            for (const key in settings.enabled) {
+                if (!settings.enabled[key]) continue;
+                const w = settings[key]; sumw += w;
+                let val = 0;
+                if (key === 'rsi') val = Math.abs(a.rsi - 50) / 50;
+                if (key === 'open_interest') val = a.open_interest_norm;
+                if (key === 'price_change') val = Math.abs(a.price_change);
+                if (key === 'volume_z') val = a.volume_z_norm;
+                if (key === 'correlation') val = Math.abs(a.correlation_with_index);
+                total += val * w;
+            }
+            return sumw > 0 ? Math.round((total / sumw) * 100) : 0;
+        }
+
+        // ───── Ініціалізація TradingView для main chart ─────
+        function initMainChart(symbol) {
+            new TradingView.widget({
+                autosize: true,
+                symbol: symbol + 'USDT',
+                interval: '15',
+                timezone: 'Etc/UTC',
+                theme: 'dark',
+                container_id: 'tv_chart'
+            });
+        }
+
+        // ───── Рендер карти hint у картці ─────
+        function renderHints(hints) {
+            return hints.map(h => {
+                switch (h.type) {
+                    case 'delta_hint':
+                        return `${h.delta_percent > 0 ? '+' : ''}${h.delta_percent}% за ${h.timeframe}`;
+                    case 'hint':
+                        return `Наближається до ${h.level_type} ${h.level} (${h.distance_percent}% залишилось)`;
+                    case 'user_alert':
+                        return `Ваш алерт: досяг ${h.target_price}`;
+                    case 'alert_expiring':
+                        return `Алерт ${h.target_price} спливає через ${h.expires_in}`;
+                }
+            }).join(' • ');
+        }
+
+        // ───── Рендер списку активів ─────
+        function render_list(filter = 'all') {
+            // попередні карточки
+            sidebar.querySelectorAll('.asset').forEach(el => el.remove());
+            // нормалізація для OI й Vol Z
+            const maxOI = Math.max(...assets_data.map(a => a.open_interest));
+            const minV = Math.min(...assets_data.map(a => a.volume_z)), maxV = Math.max(...assets_data.map(a => a.volume_z));
+            assets_data.forEach((a, i) => {
+                a.open_interest_norm = a.open_interest / maxOI;
+                a.volume_z_norm = maxV > minV ? (a.volume_z - minV) / (maxV - minV) : 0;
+                a.priority_score = compute_score(a);
+                // фільтрація
+                if (filter === 'hot' && a.priority_score < 75) return;
+                if (filter === 'rsi' && a.rsi <= 60) return;
+
+                // карточка
+                const div = document.createElement('div');
+                div.className = 'asset';
+                div.dataset.idx = i;
+                // heatmap
+                const hue = Math.round((a.priority_score / 100) * 120);
+                div.style.background = `hsl(${hue},50%,15%)`;
+
+                div.innerHTML = `
+          <div class="asset-header">
+            <span class="asset-symbol">${a.symbol}</span>
+            <span>
+              <span class="asset-price">${a.price.toFixed(4)}</span>
+              <span class="asset-change ${a.price_change >= 0 ? 'up' : 'down'}">
+                ${(a.price_change * 100).toFixed(2)}%
+              </span>
+              <span class="asset-badge" title="${a.badge_desc}">${a.badge_icon}</span>
+            </span>
+          </div>
+          <div class="tv-sparkline" id="tv-spark-${i}"></div>
+          <div class="asset-score"><div style="width:${a.priority_score}%"></div></div>
+          <div class="asset-hint">${renderHints(a.hints || [])}</div>
+        `;
+                div.addEventListener('click', () => select_asset(i));
+                sidebar.appendChild(div);
+
+                // ініціюємо TradingView mini-chart
+                new TradingView.widget({
+                    autosize: false,
+                    width: 100, height: 20,
+                    symbol: a.symbol + 'USDT',
+                    interval: '1',
+                    theme: 'dark',
+                    container_id: 'tv-spark-' + i
+                });
+            });
+            if (assets_data.length) select_asset(0);
+        }
+
+        // ───── Показ деталей активу ─────
+        function select_asset(idx) {
+            sidebar.querySelectorAll('.asset')
+                .forEach((el, i) => el.classList.toggle('selected', i === idx));
+            const a = assets_data[idx];
+            detail.style.display = 'block';
+            detail.innerHTML = `
+        <h2>${a.symbol}
+          <span class="${a.price_change >= 0 ? 'up' : 'down'}">
+            ${a.price.toFixed(4)} (${(a.price_change * 100).toFixed(2)}%)
+          </span>
+        </h2>
+        <div id="tv_chart"></div>
+        ${['Volume (avg)', 'OI', 'RSI', 'ATR', 'Vol Z', 'Corr']
+                    .map((k, j) => `
+            <div class="detail-row">
+              <div class="detail-key">${k}</div>
+              <div class="detail-value">${[(a.volume / 1e6).toFixed(2) + 'M USD',
+                        (a.open_interest / 1e6).toFixed(2) + 'M',
+                        a.rsi.toFixed(1),
+                        a.atr.toFixed(4),
+                        a.volume_z.toFixed(2),
+                        a.correlation_with_index.toFixed(2)
+                        ][j]
+                        }</div>
+            </div>`).join('')}
+        <div style="margin-top:0.75rem; font-size:0.85rem; color:#8a8f99;">
+          <strong>Причини:</strong> ${a.trigger_reasons.join(', ')}
+        </div>
+        <div style="margin-top:0.5rem; font-size:0.85rem; color:#8a8f99;">
+          <strong>Підказки:</strong> ${renderHints(a.hints || [])}
+        </div>
+      `;
+            initMainChart(a.symbol);
+        }
+
+        // ───── Fetch + оновлення ─────
+        async function fetch_data() {
+            try {
+                const res = await fetch('/api/data');
+                const json = await res.json();
+                assets_data = json.assets;
+                last_up.textContent = 'Last update: ' + new Date(json.timestamp * 1000).toLocaleTimeString();
+                const active = document.querySelector('.filters .active').dataset.filter;
+                render_list(active);
+            } catch (e) { console.error(e); }
+        }
+
+        // ───── Фільтри ─────
+        document.querySelectorAll('.filters button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelector('.filters .active').classList.remove('active');
+                btn.classList.add('active');
+                render_list(btn.dataset.filter);
+            });
+        });
+
+        // ───── Налаштування модалки ─────
+        document.getElementById('settings-btn').addEventListener('click', () => {
+            for (const key of ['rsi', 'open_interest', 'price_change', 'volume_z', 'correlation']) {
+                document.getElementById('f_' + key).checked = settings.enabled[key];
+                document.getElementById('w_' + key).value = settings[key];
+            }
+            document.getElementById('settings-modal').style.display = 'flex';
+        });
+        document.getElementById('cancel-settings').addEventListener('click', () => {
+            document.getElementById('settings-modal').style.display = 'none';
+        });
+        document.getElementById('save-settings').addEventListener('click', () => {
+            for (const key of ['rsi', 'open_interest', 'price_change', 'volume_z', 'correlation']) {
+                settings.enabled[key] = document.getElementById('f_' + key).checked;
+                settings[key] = +document.getElementById('w_' + key).value;
+            }
+            save_settings();
+            document.getElementById('settings-modal').style.display = 'none';
+            const active = document.querySelector('.filters .active').dataset.filter;
+            render_list(active);
+        });
+
+        // ───── Стартова ініціалізація ─────
+        load_settings();
+        fetch_data();
+        setInterval(fetch_data, 10000);
+    </script>
+</body>
+
+</html>
