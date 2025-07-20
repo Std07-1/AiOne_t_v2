@@ -1,81 +1,76 @@
-# stage1\utils 
-
+# stage1\utils
+# -*- coding: utf-8 -*-
+"""
+Модуль utils
+-----------------
+Універсальні утиліти для роботи з фінансовими даними, зокрема:
+- Форматування обсягу у USD (format_volume_usd)
+- Перевірка робочих годин американської торгової сесії (is_us_session)
+- Форматування Open Interest (format_open_interest)
+Всі логи — україномовні, з підтримкою RichHandler для зручної діагностики.
+"""
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import logging
-import pandas as pd
 
-logger = logging.getLogger("utils ")
+from rich.console import Console
+from rich.logging import RichHandler
+
+# --- Налаштування логування ---
+logger = logging.getLogger("stage1.utils")
 logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+logger.propagate = False
 
-def standardize_format(df: pd.DataFrame, timezone: str = "UTC") -> pd.DataFrame:
-    """
-    Перетворює колонку 'timestamp' у формат datetime із заданим часовим поясом.
-    Якщо дані числові, визначаємо, чи вони в секундах чи мілісекундах.
-    Якщо часові мітки tz-naive, локалізуємо їх до UTC, а потім конвертуємо у заданий часовий пояс.
-
-    Args:
-        df (pd.DataFrame): Вхідний DataFrame із колонкою 'timestamp'.
-        timezone (str): Цільовий часовий пояс (за замовчуванням "UTC").
-
-    Returns:
-        pd.DataFrame: Нова копія DataFrame із коректно перетвореною колонкою 'timestamp'.
-    """
-    # Щоб уникнути SettingWithCopyWarning — спочатку явно копіюємо весь DF
-    df = df.copy()
-
-    if "timestamp" in df.columns:
-        ts = df["timestamp"]
-
-        # Якщо не в datetime
-        if not pd.api.types.is_datetime64_any_dtype(ts):
-            ts = pd.to_datetime(ts, utc=True)
-
-        # Локалізуємо (якщо потрібно) і конвертуємо в бажаний timezone
-        # з двома кроками: локалізація → конвертація
-        if ts.dt.tz is None:
-            ts = ts.dt.tz_localize("UTC")
-        ts = ts.dt.tz_convert(timezone)
-
-        # Записуємо назад у копію DataFrame
-        df.loc[:, "timestamp"] = pd.to_datetime(ts, utc=True).astype("int64") // 10**9
-
-
-    return df
 
 def format_volume_usd(volume: float | str) -> str:
     """
     Форматує оборот у USD.
     Приймає як float, так і вже відформатований рядок —
     у другому випадку повертає його без змін.
+    :param volume: float або str
+    :return: відформатований рядок
     """
+    logger.debug(f"[format_volume_usd] Вхідне значення: {volume}")
     if isinstance(volume, str):
+        logger.debug("[format_volume_usd] Вже рядок, повертаємо як є")
         return volume
-
     if volume >= 1e12:
-        return f"{volume/1e12:.2f}T USD"
-    if volume >= 1e9:
-        return f"{volume/1e9:.2f}G USD"
-    if volume >= 1e6:
-        return f"{volume/1e6:.2f}M USD"
-    if volume >= 1e3:
-        return f"{volume/1e3:.2f}K USD"
-    return f"{volume:.2f} USD"
+        result = f"{volume/1e12:.2f}T USD"
+    elif volume >= 1e9:
+        result = f"{volume/1e9:.2f}G USD"
+    elif volume >= 1e6:
+        result = f"{volume/1e6:.2f}M USD"
+    elif volume >= 1e3:
+        result = f"{volume/1e3:.2f}K USD"
+    else:
+        result = f"{volume:.2f} USD"
+    logger.debug(f"[format_volume_usd] Вихід: {result}")
+    return result
+
 
 def is_us_session(current_time: datetime) -> bool:
     """
     Перевіряє, чи поточний час входить до робочих годин американської торгової сесії (9:30–16:00 ET).
+    :param current_time: datetime
+    :return: bool
     """
+    logger.debug(f"[is_us_session] Вхідний час: {current_time}")
     try:
         eastern = current_time.astimezone(ZoneInfo("America/New_York"))
+        logger.debug(f"[is_us_session] Конвертовано до ET: {eastern}")
     except Exception as e:
         logger.error(f"Помилка конвертації часу: {e}")
         return False
     start = time(9, 30)
     end = time(16, 0)
     result = eastern.weekday() < 5 and start <= eastern.time() <= end
-    logger.debug(f"[is_us_session] Поточний час (ET): {eastern.time()} — US сесія = {result}")
+    logger.debug(
+        f"[is_us_session] Поточний час (ET): {eastern.time()} — US сесія = {result}"
+    )
     return True  # або повернути result для реальної перевірки
+
 
 def format_open_interest(oi: float) -> str:
     """
@@ -84,16 +79,22 @@ def format_open_interest(oi: float) -> str:
     якщо >= 1e6, повертає у мільйонах (M);
     якщо >= 1e3, повертає у тисячах (K);
     інакше повертає стандартне значення.
+    :param oi: float
+    :return: відформатований рядок
     """
+    logger.debug(f"[format_open_interest] Вхідне значення: {oi}")
     try:
         val = float(oi)
     except (ValueError, TypeError):
-        return '-'
-    if oi >= 1e9:
-        return f"{oi / 1e9:.2f}B"
-    elif oi >= 1e6:
-        return f"{oi / 1e6:.2f}M"
-    elif oi >= 1e3:
-        return f"{oi / 1e3:.2f}K"
+        logger.debug("[format_open_interest] Неможливо конвертувати у float")
+        return "-"
+    if val >= 1e9:
+        result = f"{val / 1e9:.2f}B"
+    elif val >= 1e6:
+        result = f"{val / 1e6:.2f}M"
+    elif val >= 1e3:
+        result = f"{val / 1e3:.2f}K"
     else:
-        return f"{oi:.2f} USD"
+        result = f"{val:.2f} USD"
+    logger.debug(f"[format_open_interest] Вихід: {result}")
+    return result

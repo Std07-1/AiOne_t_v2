@@ -34,16 +34,14 @@ class CalibrationEngine:
 
     def __init__(
         self,
-        buffer: Any,
         fetcher: Any,
         redis_client,
-        ram_buffer,
+        ram_buffer,  # Об'єднаний буфер для даних
         interval: str = "1m",
         min_bars: int = 30,
         metric: str = "profit_factor",
         calib_queue: Optional[Any] = None,
     ):
-        self.buffer = buffer
         self.fetcher = fetcher
         self.interval = interval
         self.min_bars = 500 if interval == "1m" else min_bars
@@ -155,7 +153,7 @@ class CalibrationEngine:
         # Завантаження даних
         df = await load_data(
             self.fetcher,
-            self.buffer,
+            self.ram_buffer,
             symbol,
             timeframe,
             date_from,
@@ -388,7 +386,7 @@ class CalibrationEngine:
             oos_date_from = date_to - timedelta(days=30)
             oos_df = await load_data(
                 self.fetcher,
-                self.buffer,
+                self.ram_buffer,
                 symbol,
                 timeframe,
                 oos_date_from,

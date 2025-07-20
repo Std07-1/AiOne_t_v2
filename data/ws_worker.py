@@ -47,17 +47,21 @@ logging.getLogger("websockets.client.protocol").setLevel(logging.WARNING)
 
 # ────────────────────── WS Worker ──────────────────────
 
+
 class WSWorker:
     """
     WebSocket-воркер: стрім 1m-барів Binance → RAMBuffer (для stage1) і Redis (fallback).
     """
+
     def __init__(
         self,
         symbols: Optional[List[str]] = None,
         ram_buffer: Optional[RAMBuffer] = None,
         redis_cache: Optional[Any] = None,
     ):
-        self._symbols: Set[str] = set([s.lower() for s in symbols] if symbols else DEFAULT_SYMBOLS)
+        self._symbols: Set[str] = set(
+            [s.lower() for s in symbols] if symbols else DEFAULT_SYMBOLS
+        )
         self._ws_url: Optional[str] = None
         self._backoff: int = 3
         self._refresh_task: Optional[asyncio.Task] = None
@@ -69,7 +73,7 @@ class WSWorker:
         """
         Отримує whitelist символів (prefilter із Redis або ENV).
         """
-        data = await self.cache.get_fast_symbols()   # ← використовує self.cache!
+        data = await self.cache.get_fast_symbols()  # ← використовує self.cache!
         # Дефолт — якщо нічого не прийшло, або тип невідомий
         syms = []
         if isinstance(data, dict):
@@ -78,11 +82,21 @@ class WSWorker:
             syms = data
         # Fallback якщо порожній
         if not syms:
-            logger.warning("[WSWorker] selector:active:stream пустий або невалидний, fallback btcusdt")
+            logger.warning(
+                "[WSWorker] selector:active:stream пустий або невалидний, fallback btcusdt"
+            )
             syms = DEFAULT_SYMBOLS
         if len(syms) < 3:
-            logger.warning("[WSWorker] ВАЖЛИВО: Кількість symbols у стрімі підозріло мала: %d (%s)", len(syms), syms)
-        logger.debug("[WSWorker][_get_live_symbols] data type: %s, value: %s", type(data), str(data)[:200])
+            logger.warning(
+                "[WSWorker] ВАЖЛИВО: Кількість symbols у стрімі підозріло мала: %d (%s)",
+                len(syms),
+                syms,
+            )
+        logger.debug(
+            "[WSWorker][_get_live_symbols] data type: %s, value: %s",
+            type(data),
+            str(data)[:200],
+        )
         logger.debug("[WSWorker] Символи для стріму: %d (%s...)", len(syms), syms[:10])
         return syms
 
@@ -93,9 +107,19 @@ class WSWorker:
     async def _store_minute(self, sym: str, ts: int, k: Dict[str, Any]) -> pd.DataFrame:
         """Оновлює 1m DataFrame в Redis."""
         raw = await CACHE.fetch_from_cache(sym, "1m", prefix="candles", raw=True)
-        df = _bytes_to_df(raw) if raw else pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        df = (
+            _bytes_to_df(raw)
+            if raw
+            else pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        )
         dt = pd.to_datetime(ts, unit="ms", utc=True)
-        df.loc[dt] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
+        df.loc[dt] = [
+            float(k["o"]),
+            float(k["h"]),
+            float(k["l"]),
+            float(k["c"]),
+            float(k["v"]),
+        ]
         await CACHE.store_in_cache(
             sym, "1m", _df_to_bytes(df), ttl=TTL_1M, prefix="candles", raw=True
         )
@@ -104,10 +128,16 @@ class WSWorker:
     async def _on_final_candle(self, sym: str, df_1m: pd.DataFrame) -> None:
         """Агрегує 1h-бар, зберігає у Redis, публікує подію."""
         df_1h = (
-            df_1m
-            .resample("1h", label="right", closed="right")
-            .agg({"open": "first", "high": "max",
-                  "low": "min", "close": "last", "volume": "sum"})
+            df_1m.resample("1h", label="right", closed="right")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
             .dropna()
         )
         await CACHE.store_in_cache(
@@ -137,8 +167,13 @@ class WSWorker:
         self.buffer.add(sym, tf, bar)
         # Логувати тільки при новому bar (x==True) або зміні timestamp
         if k.get("x", False):
-            logger.debug("[WSWorker][heartbeat] FINAL bar у RAMBuffer: %s (%d)", sym, ts)
-        elif self.buffer.data[sym][tf] and self.buffer.data[sym][tf][-1]["timestamp"] == ts:
+            logger.debug(
+                "[WSWorker][heartbeat] FINAL bar у RAMBuffer: %s (%d)", sym, ts
+            )
+        elif (
+            self.buffer.data[sym][tf]
+            and self.buffer.data[sym][tf][-1]["timestamp"] == ts
+        ):
             logger.debug("[WSWorker][heartbeat] partial update %s (%d)", sym, ts)
 
         # Запис у Redis (як fallback і для stage2+)
@@ -158,18 +193,29 @@ class WSWorker:
             except Exception as e:
                 logger.warning("Refresh symbols error: %s", e)
 
-    async def _resubscribe(self, ws: websockets.WebSocketClientProtocol, new_syms: Set[str]) -> None:
+    async def _resubscribe(
+        self, ws: websockets.WebSocketClientProtocol, new_syms: Set[str]
+    ) -> None:
         """UNSUBSCRIBE/SUBSCRIBE WS-канали без reconnect."""
         old_syms = self._symbols
         to_unsub = [f"{s}@kline_1m" for s in old_syms - new_syms]
         to_sub = [f"{s}@kline_1m" for s in new_syms - old_syms]
         rid = 1
         if to_unsub:
-            await ws.send(json.dumps({"method": "UNSUBSCRIBE", "params": to_unsub, "id": rid}))
+            await ws.send(
+                json.dumps({"method": "UNSUBSCRIBE", "params": to_unsub, "id": rid})
+            )
             rid += 1
         if to_sub:
-            await ws.send(json.dumps({"method": "SUBSCRIBE", "params": to_sub, "id": rid}))
-            logger.debug("WS re-subscribed +%d -%d total=%d", len(to_sub), len(to_unsub), len(new_syms))
+            await ws.send(
+                json.dumps({"method": "SUBSCRIBE", "params": to_sub, "id": rid})
+            )
+            logger.debug(
+                "WS re-subscribed +%d -%d total=%d",
+                len(to_sub),
+                len(to_unsub),
+                len(new_syms),
+            )
         self._symbols = new_syms
 
     async def consume(self) -> None:
@@ -185,7 +231,11 @@ class WSWorker:
                     self._symbols = syms
                     self._ws_url = self._build_ws_url(self._symbols)
 
-                logger.info("🔄 Запуск WS (%d symbols): %s", len(self._symbols), list(self._symbols)[:5])
+                logger.info(
+                    "🔄 Запуск WS (%d symbols): %s",
+                    len(self._symbols),
+                    list(self._symbols)[:5],
+                )
                 async with websockets.connect(self._ws_url, ping_interval=20) as ws:
                     logger.debug("WS connected (%d streams)…", len(self._symbols))
                     self._backoff = 3
@@ -201,7 +251,9 @@ class WSWorker:
                                 msg_for_log = msg
                                 if isinstance(msg, dict):
                                     msg_for_log = json.dumps(msg, default=str)[:80]
-                                logger.debug("Bad WS message: %s… (%s)", str(msg)[:200], e)
+                                logger.debug(
+                                    "Bad WS message: %s… (%s)", str(msg)[:200], e
+                                )
                             except Exception as e2:
                                 logger.debug("Bad WS message: <unserializable> (%s)", e)
             except Exception as exc:
@@ -212,12 +264,12 @@ class WSWorker:
                 if self._refresh_task:
                     self._refresh_task.cancel()
 
-
     async def stop(self) -> None:
         """Зупиняє воркер і всі фонові таски."""
         self._stop_event.set()
         if self._refresh_task:
             self._refresh_task.cancel()
+
 
 # ──────────────── Запуск модуля ────────────────
 

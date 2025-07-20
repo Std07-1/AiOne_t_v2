@@ -2,6 +2,7 @@
 Основний модуль запуску системи AiOne_t
 app/main.py
 """
+
 import time
 import json
 import time
@@ -11,11 +12,14 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import asdict
+from datetime import datetime, timedelta
 
+from redis.asyncio import Redis
+import subprocess
 import aiohttp
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -23,107 +27,62 @@ from fastapi.staticfiles import StaticFiles
 from data.cache_handler import SimpleCacheHandler
 from data.raw_data import OptimizedDataFetcher
 from data.file_manager import FileManager
-from stage1.asset_monitoring import AssetMonitorStage1, screening_producer
 from data.ws_worker import WSWorker
 from data.ram_buffer import RAMBuffer
 
+from stage1.asset_monitoring import AssetMonitorStage1
+from app.screening_producer import screening_producer
 from UI.ui_consumer import UI_Consumer
-from stage1.optimized_asset_filter import get_prefiltered_symbols
-
+from stage1.optimized_asset_filter import get_filtered_assets
+from stage3.trade_manager import TradeLifecycleManager
+from stage2.calibration_engine import CalibrationEngine
 from app.settings import settings
 from rich.console import Console
 from rich.logging import RichHandler
+from .utils.metrics import MetricsCollector
+from app.calibration_queue import CalibrationQueue, AssetClassConfig
+from app.screening_producer import AssetStateManager
 
 # Завантажуємо налаштування з .env
 load_dotenv()
 
+# Глобальний Redis-кеш, ініціалізується при старті
+cache_handler: SimpleCacheHandler
+
 # --- Логування ---
 main_logger = logging.getLogger("main")
-main_logger.setLevel(logging.INFO)
+main_logger.setLevel(logging.DEBUG)
 main_logger.handlers.clear()
 main_logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-main_logger.propagate = False   # ← Критично важливо!
+main_logger.propagate = False  # ← Критично важливо!
 
-def debug_ram_buffer(buffer, symbols, tf="1m"):
-    import time
-    now = int(time.time() * 1000)
-    for sym in symbols:
-        bars = buffer.get(sym, tf, 3)
-        if bars:
-            last_ts = bars[-1]['timestamp']
-            print(f"[{sym}] Last bar: {last_ts} | Age: {(now - last_ts) // 1000}s")
-        else:
-            print(f"[{sym}] No bars in RAMBuffer")
 
 # Створюємо FastAPI-додаток
 app = FastAPI()
+router = APIRouter()
 
 # Шлях до кореня проекту
 BASE_DIR = Path(__file__).resolve().parent.parent
 # Каталог зі статичними файлами (фронтенд WebApp)
 STATIC_DIR = BASE_DIR / "static"
 
-# 1) Роздача статичних ресурсів під /static
-app.mount(
-    "/static",
-    StaticFiles(directory=str(STATIC_DIR)),
-    name="static",
-)
 
-# 2) GET / → повертає index.html
-@app.get("/", include_in_schema=False)
-async def serve_index():
+def launch_ui_consumer():
     """
-    Віддає головну сторінку WebApp (index.html).
+    Запуск UI/ui_consumer_entry.py у новому терміналі (Windows).
     """
-    index_path = STATIC_DIR / "index.html"
-    return FileResponse(str(index_path))
-
-
-# Глобальний Redis-кеш, ініціалізується при старті
-cache_handler: SimpleCacheHandler
-
-@app.on_event("startup")
-async def on_startup():
-    """
-    Подія запуску FastAPI:
-      - Підключається до Redis (через URL або host/port)
-      - Запускає фоновий таск для pipeline
-    """
-    global cache_handler
-
-    redis_url = os.getenv("REDIS_URL")
-    if redis_url:
-        cache_handler = SimpleCacheHandler.from_url(redis_url)
-        main_logger.info("🔗 Підключено до Redis via URL: %s", redis_url)
+    proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if sys.platform.startswith("win"):
+        subprocess.Popen(
+            ["start", "cmd", "/k", "python", "-m", "UI.ui_consumer_entry"],
+            shell=True,
+            cwd=proj_root,  # запуск з кореня проекту, щоб UI бачився як модуль
+        )
     else:
-        cache_handler = SimpleCacheHandler(
-            host=settings.redis_host,
-            port=settings.redis_port,
+        subprocess.Popen(
+            ["gnome-terminal", "--", "python3", "-m", "UI.ui_consumer_entry"],
+            cwd=proj_root,
         )
-        main_logger.info(
-            "🔗 Підключено до Redis via host/port: %s:%s",
-            settings.redis_host,
-            settings.redis_port,
-        )
-
-    # Запускаємо головний конвеєр обробки в фоновому таску
-    asyncio.create_task(run_pipeline())
-
-
-@app.get("/api/data")
-async def api_data():
-    """
-    Ендпоінт для фронтенду: повертає останні дані asset_stats.
-    Читає Redis-ключ "asset_stats:global".
-    """
-    raw = await cache_handler.fetch_from_cache("asset_stats", "global")
-    if not raw:
-        # якщо даних ще немає — повертаємо пустий список
-        return JSONResponse({"timestamp": int(time.time()), "assets": []})
-
-    top10 = json.loads(raw.decode("utf-8"))
-    return JSONResponse({"timestamp": int(time.time()), "assets": top10})
 
 
 def validate_settings() -> None:
@@ -146,7 +105,7 @@ def validate_settings() -> None:
 
     if missing:
         raise ValueError(f"Відсутні налаштування: {', '.join(missing)}")
-        
+
     main_logger.info("Налаштування перевірено — OK.")
 
 
@@ -162,18 +121,257 @@ async def init_system() -> SimpleCacheHandler:
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
         handler = SimpleCacheHandler.from_url(redis_url)
-        #logger.debug("Redis через URL: %s", redis_url)
+        # logger.debug("Redis через URL: %s", redis_url)
     else:
         handler = SimpleCacheHandler(
             host=settings.redis_host,
             port=settings.redis_port,
         )
-        #logger.debug(
+        # logger.debug(
         #    "Redis через host/port: %s:%s",
         #    settings.redis_host,
         #    settings.redis_port,
-        #)
+        # )
     return handler
+
+
+# --- Дебаг-функція для RAMBuffer ---
+def debug_ram_buffer(buffer, symbols, tf="1m"):
+    """
+    Дебажить свіжість барів у RAMBuffer для заданих символів.
+    """
+    now = int(time.time() * 1000)
+    for sym in symbols:
+        bars = buffer.get(sym, tf, 3)
+        if bars:
+            last_ts = bars[-1]["timestamp"]
+            print(f"[{sym}] Last bar: {last_ts} | Age: {(now - last_ts) // 1000}s")
+        else:
+            print(f"[{sym}] No bars in RAMBuffer")
+
+
+# --- Фоновий таск: періодичне оновлення fast_symbols через prefilter ---
+async def periodic_prefilter_and_update(
+    cache, session, thresholds, interval=600, buffer=None, fetcher=None, lookback=500
+):
+    """
+    Періодично виконує prefilter та оновлює fast_symbols у Redis.
+    Додає preload історії для нових активів.
+    """
+    # Початковий набір символів
+    initial_symbols = set(await cache.get_fast_symbols())
+    prev_symbols = initial_symbols.copy()
+
+    # Затримка перед першим оновленням (щоб уникнути конфлікту з первинним префільтром)
+    await asyncio.sleep(interval)  # Чекаємо звичайний інтервал (600 сек)
+    while True:
+        try:
+            main_logger.info("🔄 Оновлення списку fast_symbols через prefilter...")
+            fast_symbols = await get_filtered_assets(
+                session=session,
+                cache_handler=cache,
+                thresholds=thresholds,
+                dynamic=True,
+            )
+
+            if fast_symbols:
+                fast_symbols = [s.lower() for s in fast_symbols]
+                current_symbols = set(fast_symbols)
+                await cache.set_fast_symbols(
+                    fast_symbols, ttl=interval * 2
+                )  # TTL 1200 сек
+
+                main_logger.info(
+                    "Prefilter: %d символів записано у Redis: %s",
+                    len(fast_symbols),
+                    fast_symbols[:5],
+                )
+
+                # --- preload для нових активів ---
+                if buffer is not None and fetcher is not None:
+                    # Знаходимо ТІЛЬКИ нові символи
+                    new_symbols = current_symbols - prev_symbols
+
+                    # Додаємо debug-лог для відстеження станів символів
+                    main_logger.debug(
+                        f"Стан символів: "
+                        f"Поточні={len(current_symbols)}, "
+                        f"Попередні={len(prev_symbols)}, "
+                        f"Нові={len(new_symbols)}"
+                    )
+                    if new_symbols:
+                        new_symbols_list = list(new_symbols)
+                        main_logger.info(
+                            f"Preload історії для {len(new_symbols_list)} нових активів"
+                        )
+                        await preload_1m_history(
+                            fetcher, new_symbols_list, buffer, lookback=lookback
+                        )
+                        await preload_daily_levels(fetcher, new_symbols_list, days=30)
+
+                # Оновлюємо попередні символи
+                prev_symbols = current_symbols
+            else:
+                main_logger.warning(
+                    "Prefilter повернув порожній список, fast_symbols не оновлено."
+                )
+        except Exception as e:
+            main_logger.warning("Помилка оновлення prefilter: %s", e)
+
+        await asyncio.sleep(interval)  # 600 сек
+
+
+# --- Preload історії для Stage1 ---
+async def preload_1m_history(fetcher, fast_symbols, buffer, lookback=50):
+    """
+    Preload історичних 1m-барів для швидкого старту Stage1.
+    Перевіряє, що lookback >= 12 (мінімум для індикаторів типу RSI/ATR).
+    """
+    if lookback < 12:
+        main_logger.warning(
+            "lookback (%d) для 1m-барів занадто малий. Встановлено мінімум 12.",
+            lookback,
+        )
+        lookback = 12
+
+    main_logger.info(
+        "Preload 1m: завантажуємо %d 1m-барів для %d символів…",
+        lookback,
+        len(fast_symbols),
+    )
+    hist_data = await fetcher.get_data_batch(
+        fast_symbols,
+        interval="1m",
+        limit=lookback,
+        min_candles=lookback,
+        show_progress=True,
+        read_cache=False,
+        write_cache=True,
+    )
+
+    # Додаємо бари в RAMBuffer
+    for sym, df in hist_data.items():
+        for bar in df.to_dict("records"):
+            ts = bar["timestamp"]
+            if isinstance(ts, pd.Timestamp):
+                bar["timestamp"] = int(ts.value // 1_000_000)
+            else:
+                bar["timestamp"] = int(ts)
+            buffer.add(sym.lower(), "1m", bar)
+    main_logger.info(
+        "Preload 1m завершено: історія додана в RAMBuffer для %d символів.",
+        len(hist_data),
+    )
+    return hist_data
+
+
+# --- Preload денних барів для глобальних рівнів ---
+async def preload_daily_levels(fetcher, fast_symbols, days=30):
+    """
+    Preload денного таймфрейму для розрахунку глобальних рівнів підтримки/опору.
+    Перевіряє, що days >= 30.
+    """
+    if days < 30:
+        main_logger.warning(
+            "Кількість днів (%d) для денних барів занадто мала. Встановлено мінімум 30.",
+            days,
+        )
+        days = 30
+
+    main_logger.info(
+        "Preload Daily: завантажуємо %d денних свічок для %d символів…",
+        days,
+        len(fast_symbols),
+    )
+    daily_data = await fetcher.get_data_batch(
+        fast_symbols,
+        interval="1d",
+        limit=days,
+        min_candles=days,
+        show_progress=False,
+        read_cache=False,
+        write_cache=False,
+    )
+    main_logger.info("Preload Daily завершено для %d символів.", len(daily_data))
+    return daily_data
+
+
+# --- HealthCheck для RAMBuffer ---
+async def ram_buffer_healthcheck(
+    buffer, symbols, max_age=90, interval=30, ws_worker=None, tf="1m"
+):
+    """
+    Моніторинг живучості даних у RAMBuffer.
+    Якщо дані по символу не оновлювались >max_age сек — лог WARN і опційно перезапуск WSWorker.
+    """
+    while True:
+        now = int(time.time() * 1000)
+        dead = []
+        for sym in symbols:
+            bars = buffer.get(sym, tf, 1)
+            if not bars or (now - bars[-1]["timestamp"]) > max_age * 1000:
+                dead.append(sym)
+        if dead:
+            main_logger.warning("[HealthCheck] Symbols stalled: %s", dead)
+            if ws_worker is not None:
+                main_logger.warning(
+                    "[HealthCheck] Restarting WSWorker через застій символів."
+                )
+                await ws_worker.stop()
+                asyncio.create_task(ws_worker.consume())
+        else:
+            main_logger.debug(
+                "[HealthCheck] Всі символи активні (перевірено %d).", len(symbols)
+            )
+        await asyncio.sleep(interval)
+
+
+async def trade_manager_updater(
+    trade_manager: TradeLifecycleManager,
+    buffer: RAMBuffer,
+    monitor: AssetMonitorStage1,
+    timeframe: str = "1m",
+    lookback: int = 20,
+    interval_sec: int = 10,
+):
+    """
+    Фоновий таск: оновлює активні угоди,
+    бере ATR/RSI/VOLUME із Stage1.stats, а не з сирих барів,
+    і виводить лічильники active/closed.
+    """
+    while True:
+        # 1) Оновлюємо всі активні угоди
+        active = await trade_manager.get_active_trades()
+        for tr in active:
+            sym = tr["symbol"]
+            bars = buffer.get(sym, timeframe, lookback)
+            if not bars or len(bars) < lookback:
+                continue
+
+            df = pd.DataFrame(bars)
+            # Використовуємо AssetMonitorStage1 для отримання stats
+            stats = (
+                await monitor.get_current_stats(sym, df)
+                if hasattr(monitor, "get_current_stats")
+                else {}
+            )
+            market_data = {
+                "price": stats.get("current_price", 0),
+                "atr": stats.get("atr", 0),
+                "rsi": stats.get("rsi", 0),
+                "volume": stats.get("volume_mean", 0),
+                "context_break": stats.get("context_break", False),
+            }
+            await trade_manager.update_trade(tr["id"], market_data)
+
+        # 2) Після оновлення виводимо статистику
+        active = await trade_manager.get_active_trades()
+        closed = await trade_manager.get_closed_trades()
+        main_logger.info(
+            f"🟢 Active trades: {len(active)}    🔴 Closed trades: {len(closed)}"
+        )
+
+        await asyncio.sleep(interval_sec)
 
 
 async def run_pipeline() -> None:
@@ -185,163 +383,221 @@ async def run_pipeline() -> None:
     4. Запуск скринінгу (screening_producer) для stage1
     5. (Опційно) запуск UI/live-stats/fastapi
     """
+    global calib_queue
+
     # 1. Ініціалізація
     cache = await init_system()
     file_manager = FileManager()
     buffer = RAMBuffer(max_bars=120)
 
-    # 2. Pre-filter: отримуємо список найліквідніших активів для WS
-    async with aiohttp.ClientSession() as session:
-        fast_symbols = await get_prefiltered_symbols(
-            session=session,
-            cache_handler=cache,
-            thresholds={
-                "MIN_QUOTE_VOLUME": 1_000_000.0,
-                "MIN_PRICE_CHANGE": 3.0,
-                "MIN_OPEN_INTEREST": 500_000.0,
-                "MAX_SYMBOLS": 350,   
-            },
-            dynamic=False,
-        )
-        if not fast_symbols:
-            main_logger.warning("❌ Не знайдено жодного активу після pre-filter.")
-            return
-        main_logger.info("Після pre-filter: %d символів", len(fast_symbols))
-    
-        # 2.1. Записуємо тільки через set_fast_symbols/get_fast_symbols
-        fast_symbols = [s.lower() for s in fast_symbols]
+    # Підключення до Redis
+    redis_conn = Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        decode_responses=True,
+        encoding="utf-8",
+    )
 
-        await cache.set_fast_symbols(fast_symbols, ttl=600)
-        actual_symbols = await cache.get_fast_symbols()
-        main_logger.info("WS selector записано у Redis(%d symbols): %s", len(actual_symbols), list(actual_symbols)[:5])    #: %s", actual_symbols)
-        if set(s.lower() for s in fast_symbols) != set(s.lower() for s in actual_symbols):
-            main_logger.warning("❗️Розбіжність між fast_symbols і тим, що записано у Redis!")
+    launch_ui_consumer()
+    trade_manager = TradeLifecycleManager(log_file="trade_log.jsonl")
+    file_manager = FileManager()
+    buffer = RAMBuffer(max_bars=500)
+    thresholds = {
+        "MIN_QUOTE_VOLUME": 1_000_000.0,
+        "MIN_PRICE_CHANGE": 3.0,
+        "MIN_OPEN_INTEREST": 500_000.0,
+        "MAX_SYMBOLS": 350,
+    }
+    # Додаємо оголошення глобальної змінної calib_queue
+    global calib_queue
 
-        # ─── Preload історичних 1m‐барів для швидкого старту Stage1 ───
-        lookback = 50
-        main_logger.debug(
-            "Починаємо preload історії: завантажуємо %d 1m-барів для %d символів…",
-            lookback, len(fast_symbols)
-        )
-        # Створюємо fetcher для пакетного завантаження
+    # 2. Створюємо довгоживу ClientSession
+    session = aiohttp.ClientSession()
+    try:
         fetcher = OptimizedDataFetcher(cache_handler=cache, session=session)
 
-        # … попередній preload 1m …
-        hist_data = await fetcher.get_data_batch(
-            fast_symbols,
+        # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
+        use_manual_list = False  # Змінити на False для автоматичного режиму
+
+        if use_manual_list:
+            # Ручний режим: використовуємо фіксований список
+            fast_symbols = [
+                "btcusdt",
+                "moodengusdt",
+                "tonusdt",
+                "ethusdt",
+                "bnbusdt",
+                "adausdt",
+                "solusdt",
+                "xrpusdt",
+            ]
+            await cache.set_fast_symbols(fast_symbols, ttl=3600)
+            main_logger.info(f"Використовуємо ручний список символів: {fast_symbols}")
+        else:
+            # Автоматичний режим: виконуємо первинний префільтр
+            main_logger.info("Запускаємо первинний префільтр...")
+            # Використовуємо новий механізм відбору активів
+            fast_symbols = await get_filtered_assets(
+                session=session,
+                cache_handler=cache,
+                min_quote_vol=1_000_000.0,
+                min_price_change=3.0,
+                min_oi=500_000.0,
+                min_depth=50_000.0,
+                min_atr=0.5,
+                max_symbols=350,
+                dynamic=False,
+            )
+            fast_symbols = [s.lower() for s in fast_symbols]
+            await cache.set_fast_symbols(fast_symbols, ttl=600)
+            main_logger.info(f"Первинний префільтр: {len(fast_symbols)} символів")
+
+        # Отримуємо актуальний список символів
+        fast_symbols = await cache.get_fast_symbols()
+        if not fast_symbols:
+            main_logger.error("Не вдалося отримати список символів. Завершення.")
+            return
+
+        main_logger.info(
+            f"Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
+        )
+        # ===== КІНЕЦЬ НОВОЇ ЛОГІКИ =====
+
+        # Preload історії
+        await preload_1m_history(fetcher, fast_symbols, buffer, lookback=500)
+        daily_data = await preload_daily_levels(fetcher, fast_symbols, days=30)
+
+        # --- CalibrationEngine ---
+        main_logger.info("Ініціалізуємо CalibrationEngine...")
+        calib_engine = CalibrationEngine(
+            ram_buffer=buffer,
+            fetcher=fetcher,
+            redis_client=redis_conn,
             interval="1m",
-            limit=lookback,
-            min_candles=lookback,
-            show_progress=True,
-            read_cache=False,    # вимикаємо кеш при preload
-            write_cache=True     # опціонально: одразу оновимо кеш свіжими даними
+            min_bars=50,
+            metric="profit_factor",
         )
 
-        # ─── Preload денного таймфрейму для глобальних рівнів ───
-        days = 30
-        main_logger.debug("Preload Daily: завантажуємо %d денних свічок…", days)
-        daily_data = await fetcher.get_data_batch(
-            fast_symbols,
-            interval="1d",
-            limit=days,
-            min_candles=days,
-            show_progress=False,
-            read_cache=False,
-            write_cache=False
+        # --- CalibrationQueue ---
+        main_logger.info("Ініціалізуємо CalibrationQueue...")
+        # Ініціалізуємо AssetStateManager для коректної інтеграції зі станом активів
+        assets_current = [s.lower() for s in fast_symbols]
+        state_manager = AssetStateManager(assets_current)
+        calib_queue = CalibrationQueue(
+            cache=cache,
+            calib_engine=calib_engine,
+            max_concurrent=15,
+            state_manager=state_manager,
         )
-        # Передамо в монітор глобальні рівні
+        await calib_queue.start_workers(n_workers=20)  # Збільшуємо кількість воркерів
 
-        # Наповнюємо RAMBuffer отриманими свічками
-        for sym, df in hist_data.items():
-            for bar in df.to_dict("records"):
-                # Конвертуємо pandas.Timestamp → ms
-                ts = bar["timestamp"]
-                if isinstance(ts, pd.Timestamp):
-                    bar["timestamp"] = int(ts.value // 1_000_000)
-                else:
-                    bar["timestamp"] = int(ts)
-                buffer.add(sym.lower(), "1m", bar)
-        main_logger.debug(
-            "Preload завершено: історія додана в RAMBuffer для %d символів",
-            len(hist_data)
+        # Ініціалізація AssetMonitorStage1
+        main_logger.info("Ініціалізуємо AssetMonitorStage1...")
+        monitor = AssetMonitorStage1(
+            cache_handler=cache,
+            vol_z_threshold=2.5,
+            rsi_overbought=70,
+            rsi_oversold=30,
+            min_reasons_for_alert=2,
+        )
+        monitor.set_global_levels(daily_data)
+
+        # --- Виконуємо фон-воркери ---
+        ws_task = asyncio.create_task(WSWorker(fast_symbols, buffer, cache).consume())
+        health_task = asyncio.create_task(
+            ram_buffer_healthcheck(buffer, fast_symbols, ws_worker=None)
         )
 
-    # 3. Запуск WSWorker та RAMBuffer
-    ws_worker = WSWorker(
-        symbols=fast_symbols,
-        ram_buffer=buffer,
-        redis_cache=cache,
-    )
+        # Ініціалізуємо UI-споживача
+        main_logger.info("Ініціалізуємо UI-споживача...")
+        ui = UI_Consumer(vol_z_threshold=2.5)
 
-    # 3.1. HealthCheck — окремий таск (опціонально, але strongly recommended!)
-    async def ram_buffer_healthcheck(
-        buffer,
-        symbols,
-        max_age=90,
-        interval=30,
-        ws_worker=None,
-        tf="1m"
-    ):
-        """
-        Моніторинг живучості даних у RAMBuffer.
-        Якщо дані по символу не оновлювались >max_age сек — вважається "мертвим".
-        При знаходженні таких символів логуються WARN, і опційно перезапускається WSWorker.
-        """
-        while True:
-            now = int(time.time() * 1000)
-            dead = []
-            for sym in symbols:
-                bars = buffer.get(sym, tf, 1)
-                if not bars or (now - bars[-1]["timestamp"]) > max_age * 1000:
-                    dead.append(sym)
-            if dead:
-                main_logger .debug("[HealthCheck] Symbols stalled: %s", dead)
-                if ws_worker is not None:
-                    main_logger .debug("[HealthCheck] Restarting WSWorker due to stalled symbols")
-                    await ws_worker.stop()
-                    asyncio.create_task(ws_worker.consume())
-            else:
-                main_logger .debug("[HealthCheck] All symbols are alive (checked %d symbols).", len(symbols))
-            await asyncio.sleep(interval)
-
-    ws_task = asyncio.create_task(ws_worker.consume())
-    health_task = asyncio.create_task(ram_buffer_healthcheck(buffer, fast_symbols, ws_worker=ws_worker))
-
-    # Прогрів RAMBuffer (очікуємо перші бари)
-    await asyncio.sleep(5)
-    #debug_ram_buffer(buffer, fast_symbols)
-
-    # 4. AssetMonitor + screening_producer
-    monitor = AssetMonitorStage1(cache_handler=cache)
-
-    monitor.set_global_levels(daily_data)
-    main_logger .debug("Глобальні рівні для %d символів встановлено", len(daily_data))
-
-    queue = asyncio.Queue(maxsize=1)
-    ui = UI_Consumer(vol_z_threshold=2.5)
-
-    prod = asyncio.create_task(
-        screening_producer(
-            monitor,
-            buffer,
-            cache,            # додаємо Redis‑кеш для динаміки
-            fast_symbols,     # початковий список
-            queue,
-            timeframe="1m",
-            lookback=50,
-            interval_sec=30
+        # Запускаємо Screening Producer
+        main_logger.info("Запускаємо Screening Producer...")
+        prod = asyncio.create_task(
+            screening_producer(
+                monitor,
+                buffer,
+                cache,
+                fast_symbols,
+                redis_conn,
+                fetcher,
+                trade_manager=trade_manager,
+                timeframe="1m",
+                lookback=50,
+                interval_sec=30,
+                calib_engine=calib_engine,
+                calib_queue=calib_queue,
+                # Додаємо state_manager для повної інтеграції (опціонально)
+                state_manager=state_manager,
+            )
         )
-    )
-    cons = asyncio.create_task(
-        ui.ui_consumer(queue, refresh_rate=1.0, loading_delay=5.0, smooth_delay=0.1)
-    )
+        trade_update_task = asyncio.create_task(
+            trade_manager_updater(
+                trade_manager,
+                buffer,
+                monitor,
+            )
+        )
 
-    # Очікуємо завершення тасків (Ctrl+C — завершить все)
-    await asyncio.gather(ws_task, health_task, prod, cons)
+        # Запускаємо періодичне оновлення тільки в автоматичному режимі
+        prefilter_task = None
+        if not use_manual_list:
+            prefilter_task = asyncio.create_task(
+                periodic_prefilter_and_update(
+                    cache,
+                    session,
+                    thresholds,
+                    interval=600,
+                    buffer=buffer,
+                    fetcher=fetcher,
+                )
+            )
+
+        # Завдання для збору
+        tasks_to_run = [
+            ws_task,
+            health_task,
+            prod,
+            trade_update_task,
+        ]
+
+        if prefilter_task:
+            tasks_to_run.append(prefilter_task)
+
+        await asyncio.gather(*tasks_to_run)
+    finally:
+        await session.close()
+
+
+@router.get("/metrics")
+async def metrics_endpoint():
+    # calib_queue має бути глобально доступний або імпортований
+    global calib_queue
+    metrics = calib_queue.get_metrics()
+    output = []
+    # Лічильники
+    for key, value in metrics.get("counters", {}).items():
+        output.append(f"{key} {value}")
+    # Гістограми
+    for key, data in metrics.get("histograms", {}).items():
+        output.append(f"{key}_count {data.get('count', 0)}")
+        output.append(f"{key}_sum {data.get('sum', 0)}")
+        output.append(f"{key}_avg {data.get('avg', 0)}")
+    # Датчики
+    for key, value in metrics.get("gauges", {}).items():
+        output.append(f"{key} {value}")
+    output.append(f"system_uptime {metrics.get('uptime', 0)}")
+    return "\n".join(output)
+
+
+# Додаємо роутер до FastAPI
+app.include_router(router)
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_pipeline())
     except Exception as e:
-        main_logger .error("Помилка виконання: %s", e, exc_info=True)
+        main_logger.error("Помилка виконання: %s", e, exc_info=True)
         sys.exit(1)

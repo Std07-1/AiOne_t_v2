@@ -264,7 +264,14 @@ class CalibrationQueue:
         is_high_priority: bool = False,
         is_urgent: bool = False,
     ) -> None:
-        """Додає завдання до черги зі старінням пріоритетів та детальним логуванням. Якщо завдання вже існує — оновлює його пріоритет для термінових/ALERT."""
+        """
+        Додає завдання до черги зі старінням пріоритетів та детальним логуванням.
+        Якщо завдання вже існує — оновлює його пріоритет для термінових/ALERT.
+        Виправлено логіку видалення старого завдання: видаляється саме той кортеж, який знайдено.
+        """
+        log.debug(
+            f"[put] Вхід: symbol={symbol}, tf={tf}, priority={priority}, is_high_priority={is_high_priority}, is_urgent={is_urgent}"
+        )
 
         # Перевірка наявності символу та таймфрейму
         if not symbol or not tf:
@@ -292,14 +299,17 @@ class CalibrationQueue:
         # --- Перевірка чи завдання вже в черзі ---
         current_time = time.time()
         found_task = None
+        found_prio_tuple = None
         for prio_task in list(self._queue._queue):
             # prio_task: (priority, CalibrationTask)
             _, task = prio_task
             if task.symbol == symbol.lower() and task.tf == tf:
                 found_task = task
+                found_prio_tuple = prio_task
                 break
 
         if found_task:
+            log.debug(f"[put] Завдання вже існує: {found_task}")
             # Якщо вже є термінове — нічого не робимо
             if is_urgent and not found_task.is_urgent:
                 log.info(f"🆙 Оновлюємо пріоритет для {symbol}/{tf} (термінове)")
@@ -309,10 +319,21 @@ class CalibrationQueue:
                     is_high_priority=True,
                     created_at=current_time,
                 )
-                # Видаляємо старе завдання
-                self._queue._queue.remove((self._calculate_priority(found_task)))
+                # Видаляємо старе завдання (кортеж)
+                try:
+                    self._queue._queue.remove(found_prio_tuple)
+                    log.debug(
+                        f"[put] Видалено старий кортеж з черги: {found_prio_tuple}"
+                    )
+                except ValueError:
+                    log.error(
+                        f"Помилка видалення {symbol}/{tf} з черги: кортеж не знайдено"
+                    )
+                # Додаємо нове завдання з оновленим пріоритетом
                 await self._queue.put(self._calculate_priority(new_task))
+                log.info(f"[put] Додано оновлене термінове завдання для {symbol}/{tf}")
                 return
+            log.debug(f"[put] Завдання вже в черзі, дубль не додається")
             return  # Завдання вже в черзі, не додаємо дубль
 
         log.info(

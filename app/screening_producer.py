@@ -321,7 +321,7 @@ async def publish_full_state(
 
         await cache_handler.set_json("asset_state", "global", serialized_assets, ttl=30)
 
-        await redis_conn.publish(
+        redis_conn.publish(
             "asset_state_update", json.dumps(serialized_assets, default=str)
         )
 

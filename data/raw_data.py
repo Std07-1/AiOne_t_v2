@@ -50,7 +50,7 @@ from .utils import get_ttl_for_interval
 # ───────────────────────────── ЛОГУВАННЯ ─────────────────────────────
 logger = logging.getLogger("raw_data")
 logger.setLevel(logging.INFO)
-progress_console  = Console(file=sys.stderr)
+progress_console = Console(file=sys.stderr)
 _handler = rich.logging.RichHandler(
     console=progress_console,
     show_level=True,
@@ -66,11 +66,12 @@ logger.propagate = False
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 BINANCE_FUTURES_EXINFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-MAX_PARALLEL_KLINES = 10          # макс. одночасно REST‑запитів за свічками
+MAX_PARALLEL_KLINES = 10  # макс. одночасно REST‑запитів за свічками
 _KLINE_SEM = asyncio.Semaphore(MAX_PARALLEL_KLINES)
 
 # глобальний семафор для усіх інших REST‑викликів
 GLOBAL_SEMAPHORE = asyncio.Semaphore(25)
+
 
 # ───────────────────────────── допоміжні функції ────────────────────────────
 def _log_dataframe(df: pd.DataFrame, label: str) -> None:
@@ -78,6 +79,7 @@ def _log_dataframe(df: pd.DataFrame, label: str) -> None:
     if logger.isEnabledFor(logging.DEBUG) and not df.empty:
         snippet = pd.concat([df.head(3), df.tail(3)]).to_dict("records")
         logger.debug("%s  head:3\\tail:3=%s", label, snippet)
+
 
 def _prepare_kline(df: pd.DataFrame, *, resample_to: str | None = None) -> pd.DataFrame:
     """
@@ -89,24 +91,35 @@ def _prepare_kline(df: pd.DataFrame, *, resample_to: str | None = None) -> pd.Da
     if df.empty:
         return df
 
-    df = df.astype({
-        "open": "float32", "high": "float32",
-        "low": "float32",  "close": "float32",
-        "volume": "float32"
-    })
+    df = df.astype(
+        {
+            "open": "float32",
+            "high": "float32",
+            "low": "float32",
+            "close": "float32",
+            "volume": "float32",
+        }
+    )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
     if resample_to:
-        df = (df.set_index("timestamp")
-                .resample(resample_to, label="right", closed="right")
-                .agg({
-                    "open": "first", "high": "max",
-                    "low": "min",   "close": "last",
-                    "volume": "sum"
-                })
-                .dropna()
-                .reset_index())
+        df = (
+            df.set_index("timestamp")
+            .resample(resample_to, label="right", closed="right")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+            .reset_index()
+        )
     return df
+
 
 def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
     """
@@ -114,10 +127,15 @@ def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
     Timestamp (datetime) → int64 ms для JS‑дружнього формату.
     """
     df_out = df.copy()
-    if "timestamp" in df_out.columns and pd.api.types.is_datetime64_any_dtype(df_out["timestamp"]):
-        df_out["timestamp"] = (df_out["timestamp"].astype("int64") // 1_000_000).astype("int64")
+    if "timestamp" in df_out.columns and pd.api.types.is_datetime64_any_dtype(
+        df_out["timestamp"]
+    ):
+        df_out["timestamp"] = (df_out["timestamp"].astype("int64") // 1_000_000).astype(
+            "int64"
+        )
     raw_json = orjson.dumps(df_out.to_dict(orient="split"))
     return compress(raw_json) if compress_lz4 else raw_json
+
 
 def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
     """
@@ -137,6 +155,7 @@ def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"Не вдалося розпакувати DataFrame: {e}") from e
 
+
 # ───────────────────────── network primitives ──────────────────────────
 async def fetch_with_retry(
     session: aiohttp.ClientSession,
@@ -152,18 +171,29 @@ async def fetch_with_retry(
     """
     for attempt in range(1, max_retries + 1):
         try:
-            async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
                 text = await resp.text()
                 if resp.status == 200:
                     return text
-                logger.warning("[fetch_with_retry] %s (спроба=%d) => HTTP %d, body=%s",
-                               url, attempt, resp.status, text[:200])
-        except (aiohttp.ClientConnectorError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as err:
+                logger.warning(
+                    "[fetch_with_retry] %s (спроба=%d) => HTTP %d, body=%s",
+                    url,
+                    attempt,
+                    resp.status,
+                    text[:200],
+                )
+        except (
+            aiohttp.ClientConnectorError,
+            aiohttp.ClientPayloadError,
+            asyncio.TimeoutError,
+        ) as err:
             logger.warning("[fetch_with_retry] %s (спроба=%d) => %s", url, attempt, err)
         if attempt < max_retries:
             await asyncio.sleep(backoff_sec)
     raise aiohttp.ClientError(f"Не вдалося отримати {url} після {max_retries} спроб.")
+
 
 def parse_futures_exchange_info(text: str) -> Dict[str, List[Dict[str, str]]]:
     """
@@ -184,6 +214,7 @@ def parse_futures_exchange_info(text: str) -> Dict[str, List[Dict[str, str]]]:
     df = pd.DataFrame(symbols)
     logger.debug("[FUTURES EXCHANGE] Знайдено %d символів.", len(df))
     return {"symbols": df.to_dict("records")}
+
 
 # ────────────────────── Основний клас ─────────────────────────────
 class OptimizedDataFetcher:
@@ -217,7 +248,7 @@ class OptimizedDataFetcher:
         min_candles: int = 24,
         read_cache: bool = True,
         write_cache: bool = True,
-        show_progress: bool = False,           # ← новий параметр
+        show_progress: bool = False,  # ← новий параметр
     ) -> Dict[str, pd.DataFrame]:
         """
         Паралельне завантаження до MAX_PARALLEL_KLINES символів.
@@ -231,10 +262,10 @@ class OptimizedDataFetcher:
         # Вибір контексту для прогрес‑бару
         if show_progress:
             prog_ctx = Progress(
-                SpinnerColumn(),                                                 # ⠙ спінер
-                BarColumn(bar_width=30),                                         # ━╸━━━━
+                SpinnerColumn(),  # ⠙ спінер
+                BarColumn(bar_width=30),  # ━╸━━━━
                 TextColumn("[cyan]Завантаження даних… {task.completed}/{task.total}"),
-                TimeElapsedColumn(),                                             # 0:00:03
+                TimeElapsedColumn(),  # 0:00:03
                 console=progress_console,
                 transient=True,
                 refresh_per_second=4,
@@ -242,11 +273,20 @@ class OptimizedDataFetcher:
         else:
             # "Пустий" прогрес без візуалізації
             class DummyProgress:
-                def __enter__(self): return self
-                def __exit__(self, *args): pass
-                def add_task(self, *a, **k): return None
-                def advance(self, *a, **k): pass
-                def update(self, *a, **k): pass
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def add_task(self, *a, **k):
+                    return None
+
+                def advance(self, *a, **k):
+                    pass
+
+                def update(self, *a, **k):
+                    pass
 
             prog_ctx = DummyProgress()
 
@@ -256,8 +296,12 @@ class OptimizedDataFetcher:
             tasks = [
                 asyncio.create_task(
                     self._worker_for_symbol(
-                        sym, interval, limit, min_candles,
-                        read_cache=read_cache, write_cache=write_cache
+                        sym,
+                        interval,
+                        limit,
+                        min_candles,
+                        read_cache=read_cache,
+                        write_cache=write_cache,
                     )
                 )
                 for sym in symbols
@@ -270,8 +314,9 @@ class OptimizedDataFetcher:
                     results[sym] = df
 
         elapsed = time.perf_counter() - start
-        logger.info("[BATCH] %d/%d символів готово за %.2f с.",
-                    len(results), total, elapsed)
+        logger.info(
+            "[BATCH] %d/%d символів готово за %.2f с.", len(results), total, elapsed
+        )
         return results
 
     async def _worker_for_symbol(
@@ -286,8 +331,12 @@ class OptimizedDataFetcher:
     ) -> Tuple[str, Optional[pd.DataFrame]]:
         async with _KLINE_SEM:
             df = await self.get_data(
-                symbol, interval, limit=limit, min_candles=min_candles,
-                read_cache=read_cache, write_cache=write_cache
+                symbol,
+                interval,
+                limit=limit,
+                min_candles=min_candles,
+                read_cache=read_cache,
+                write_cache=write_cache,
             )
         return symbol, df
 
@@ -320,13 +369,19 @@ class OptimizedDataFetcher:
                     df_cached = _bytes_to_df(raw, compressed=self.compress_cache)
                     df_cached = _prepare_kline(df_cached)
                 except ValueError:
-                    logger.warning("[CACHE] Пошкоджений кеш %s:%s — ігноруємо.", symbol, interval)
+                    logger.warning(
+                        "[CACHE] Пошкоджений кеш %s:%s — ігноруємо.", symbol, interval
+                    )
 
         # 2) Якщо кеш актуальний → інкрементальний апдейт
         if df_cached is not None and self._is_data_actual(df_cached, ttl, interval):
             updated = await self._incremental_update(
-                symbol, interval, df_cached,
-                ttl=ttl, cache_prefix=prefix, write_cache=write_cache
+                symbol,
+                interval,
+                df_cached,
+                ttl=ttl,
+                cache_prefix=prefix,
+                write_cache=write_cache,
             )
             if len(updated) >= min_candles:
                 return updated
@@ -334,18 +389,23 @@ class OptimizedDataFetcher:
         # 3) Інакше — повне REST‑завантаження
         df_full = await self._fetch_binance_data(symbol, interval, limit=limit)
         if df_full.empty or len(df_full) < min_candles:
-            logger.warning(f"[{symbol}][{interval}] недостатньо свічок ({len(df_full)}).")
+            logger.warning(
+                f"[{symbol}][{interval}] недостатньо свічок ({len(df_full)})."
+            )
 
             return None
 
         df_full = _prepare_kline(df_full)
-        #_log_dataframe(df_full, f"[FULL]{symbol}:{interval}")
+        # _log_dataframe(df_full, f"[FULL]{symbol}:{interval}")
 
         if write_cache:
             await self.cache_handler.store_in_cache(
-                symbol, interval,
+                symbol,
+                interval,
                 _df_to_bytes(df_full, compress_lz4=self.compress_cache),
-                ttl=ttl, prefix=prefix, raw=True
+                ttl=ttl,
+                prefix=prefix,
+                raw=True,
             )
         return df_full
 
@@ -369,24 +429,27 @@ class OptimizedDataFetcher:
         if df_new.empty:
             # немає нових свічок
             return df_cached
-        
+
         # ② Приводимо нові свічки у той же формат, що й full‑завантаження:
         #    конвертує _timestamp_→datetime, float32, тощо
         df_new = _prepare_kline(df_new)
 
         df_all = (
             pd.concat([df_cached, df_new])
-              .drop_duplicates(subset="timestamp")
-              .sort_values("timestamp")
-              .reset_index(drop=True)
+            .drop_duplicates(subset="timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
         )
-        #_log_dataframe(df_all, f"[INCR]{symbol}:{interval}")
+        # _log_dataframe(df_all, f"[INCR]{symbol}:{interval}")
 
         if write_cache:
             await self.cache_handler.store_in_cache(
-                symbol, interval,
+                symbol,
+                interval,
                 _df_to_bytes(df_all, compress_lz4=self.compress_cache),
-                ttl=ttl, prefix=cache_prefix, raw=True
+                ttl=ttl,
+                prefix=cache_prefix,
+                raw=True,
             )
         return df_all
 
@@ -406,7 +469,9 @@ class OptimizedDataFetcher:
         # Підтримуємо і lower-, і UPPER-case: для API потрібен uppercase
         sym_api = symbol.upper()
         if not sym_api.endswith("USDT"):
-            logger.error("[FETCH] Невалідний символ: %s — можливо, не USDT‑Futures", symbol)
+            logger.error(
+                "[FETCH] Невалідний символ: %s — можливо, не USDT‑Futures", symbol
+            )
             return pd.DataFrame()
 
         # Формуємо запит до Binance із UPPER‑case
@@ -431,13 +496,24 @@ class OptimizedDataFetcher:
             return pd.DataFrame()
 
         columns = [
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "trades",
-            "taker_buy_base", "taker_buy_quote", "ignore"
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_asset_volume",
+            "trades",
+            "taker_buy_base",
+            "taker_buy_quote",
+            "ignore",
         ]
         df = pd.DataFrame(parsed, columns=columns)
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+        df[["open", "high", "low", "close", "volume"]] = df[
+            ["open", "high", "low", "close", "volume"]
+        ].astype(float)
 
         logger.debug("[FETCH] %s %s — отримано %d рядків.", symbol, interval, len(df))
         return df
@@ -456,8 +532,14 @@ class OptimizedDataFetcher:
             return False
         age = (now - last_ts).total_seconds()
         status = "АКТУАЛЬНИЙ ✅" if age < max_age_sec else "ЗАСТАРІЛИЙ ❌"
-        logger.debug("[TTL] %s last=%s age=%.0fs max=%ds %s",
-                     interval, last_ts.strftime("%Y-%m-%d %H:%M:%S"), age, max_age_sec, status)
+        logger.debug(
+            "[TTL] %s last=%s age=%.0fs max=%ds %s",
+            interval,
+            last_ts.strftime("%Y-%m-%d %H:%M:%S"),
+            age,
+            max_age_sec,
+            status,
+        )
         return age < max_age_sec
 
     @staticmethod
@@ -471,10 +553,28 @@ class OptimizedDataFetcher:
         """
         Повертає справжню інформацію про ф’ючерсні контракти (USDT‑M) з кешу або REST.
         """
-        txt = await fetch_with_retry(self.session, BINANCE_FUTURES_EXINFO,
-                                     max_retries=2, timeout_sec=5.0)
+        txt = await fetch_with_retry(
+            self.session, BINANCE_FUTURES_EXINFO, max_retries=2, timeout_sec=5.0
+        )
         return parse_futures_exchange_info(txt)
 
+    async def get_data_for_calibration(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 1000,
+    ) -> Optional[pd.DataFrame]:
+        """Спеціалізований метод для калібрування з підтримкою часових діапазонів"""
+        params = {"limit": limit}
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+
+        return await self._fetch_binance_data(symbol, interval, **params)
 
 
 """
@@ -551,4 +651,3 @@ REST‑коли потрібно        ┌────────────�
                 
                 
 """
-                

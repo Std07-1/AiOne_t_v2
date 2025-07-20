@@ -1,3 +1,6 @@
+# stage1\utils_1_2.py
+# -*- coding: utf-8 -*-
+
 """
 Модуль utils_1_2
 -----------------
@@ -18,7 +21,7 @@ from rich.logging import RichHandler
 
 # --- Налаштування логування ---
 logger = logging.getLogger("utils_1_2")
-logger.setLevel(logging.DEBUG)  # Змінено на INFO для зменшення шуму
+logger.setLevel(logging.INFO)
 logger.handlers.clear()
 logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False
