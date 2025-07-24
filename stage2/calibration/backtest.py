@@ -1,10 +1,118 @@
-"""
-backtest.py: логіка бектесту, симуляції стратегії, підрахунок метрик
-"""
+"""backtest.py: логіка бектесту, симуляції стратегії, підрахунок метрик"""
 
-from typing import List, Dict, Any, Optional
+import logging
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import pandas as pd
+from rich.console import Console
+from rich.logging import RichHandler
+
+# --- Логування ---
+logger = logging.getLogger("backtest")
+logger.setLevel(logging.WARNING)
+logger.handlers.clear()
+logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+logger.propagate = False
+
+
+def calculate_signal_strength(
+    row: pd.Series, params: Dict[str, Any], direction: str
+) -> Tuple[bool, float]:
+    """Розраховує силу сигналу за системою балів"""
+    score = 0.0
+    max_score = 0.0
+
+    # Визначаємо необхідні параметри з fallback-значеннями
+    vol_thresh = params.get("volume_z_threshold", 1.0)
+    rsi_os = params.get("rsi_oversold", 30.0)
+    rsi_ob = params.get("rsi_overbought", 70.0)
+    vwap_thresh = params.get("vwap_threshold", 0.005)
+    macd_thresh = params.get("macd_threshold", 0.01)
+    stoch_os = params.get("stoch_oversold", 20.0)
+    stoch_ob = params.get("stoch_overbought", 80.0)
+
+    # Система балів для різних факторів
+    factors = []
+
+    # Volume spike (обов'язковий фактор)
+    if row.get("volume_z", 0) > vol_thresh:
+        score += 2.0
+        max_score += 2.0
+        factors.append(f"vol_z:{row['volume_z']:.2f}")
+
+    # Осцилятори (RSI/Stoch)
+    if direction == "buy":
+        if row.get("rsi", 50) < rsi_os:
+            weight = max(1.5, (rsi_os - row["rsi"]) / 5)  # Динамічний вага
+            score += weight
+            max_score += 2.0
+            factors.append(f"rsi:{row['rsi']:.1f}")
+        if row.get("stoch_k", 50) < stoch_os:
+            weight = max(1.0, (stoch_os - row["stoch_k"]) / 10)
+            score += weight
+            max_score += 1.5
+            factors.append(f"stoch:{row['stoch_k']:.1f}")
+    else:  # sell
+        if row.get("rsi", 50) > rsi_ob:
+            weight = max(1.5, (row["rsi"] - rsi_ob) / 5)
+            score += weight
+            max_score += 2.0
+            factors.append(f"rsi:{row['rsi']:.1f}")
+        if row.get("stoch_k", 50) > stoch_ob:
+            weight = max(1.0, (row["stoch_k"] - stoch_ob) / 10)
+            score += weight
+            max_score += 1.5
+            factors.append(f"stoch:{row['stoch_k']:.1f}")
+
+    # Конфірмаційні фактори (VWAP/Bollinger/MACD)
+    confirm_score = 0.0
+    confirm_max = 0.0
+
+    if direction == "buy":
+        if row.get("vwap_deviation", 0) < -vwap_thresh:
+            confirm_score += 1.0
+            factors.append(f"vwap:{row['vwap_deviation']:.3f}")
+
+        if "bollinger_lower" in row and row["close"] < row["bollinger_lower"]:
+            confirm_score += 1.2
+            factors.append("bb_lower")
+
+        macd_diff = row.get("macd", 0) - row.get("macd_signal", 0)
+        if macd_diff < -macd_thresh:
+            confirm_score += 1.0
+            factors.append(f"macd:{macd_diff:.4f}")
+    else:  # sell
+        if row.get("vwap_deviation", 0) > vwap_thresh:
+            confirm_score += 1.0
+            factors.append(f"vwap:{row['vwap_deviation']:.3f}")
+
+        if "bollinger_upper" in row and row["close"] > row["bollinger_upper"]:
+            confirm_score += 1.2
+            factors.append("bb_upper")
+
+        macd_diff = row.get("macd", 0) - row.get("macd_signal", 0)
+        if macd_diff > macd_thresh:
+            confirm_score += 1.0
+            factors.append(f"macd:{macd_diff:.4f}")
+
+    # Динамічний поріг для конфірмації
+    confirm_threshold = max(
+        0.8, min(1.5, score / 3)
+    )  # Залежить від сили основних сигналів
+    if confirm_score >= confirm_threshold:
+        score += confirm_score
+        max_score += confirm_threshold
+
+    # Адаптивний мінімальний ATR (фільтр низької волатильності)
+    atr_min = params.get("atr_min_percent", 0.001)
+    atr_required = row["close"] * atr_min
+
+    # Визначаємо чи дійсний сигнал
+    min_score = params.get("min_score", 3.5)
+    is_valid = score >= min_score and row["atr"] > atr_required and max_score > 0
+
+    confidence = min(0.99, score / max_score) if max_score > 0 else 0.0
+    return is_valid, confidence, ",".join(factors)
 
 
 def run_backtest(
@@ -13,55 +121,82 @@ def run_backtest(
     symbol: Optional[str] = None,
     timeframe: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    required_cols = ["volume_z", "rsi", "vwap_deviation", "atr"]
+    required_cols = ["volume_z", "rsi", "vwap_deviation", "atr", "close", "timestamp"]
     for col in required_cols:
         if col not in df.columns:
+            logger.warning(f"Missing column: {col}")
             return []
-    df = df.dropna(subset=required_cols)
-    if df is None or df.empty or len(df) < 20:
-        from .calibration.core import logger
 
-        logger.warning(f"Empty DataFrame received for backtest")
+    df = df.dropna(subset=required_cols).copy()
+    if df.empty or len(df) < 20:
+        logger.warning("Empty DataFrame or too short for backtest")
         return []
-    results = []
-    buy_signals = (
-        (df["volume_z"] > params.get("volume_z_threshold", 1.0))
-        & (
-            (df["rsi"] < params.get("rsi_oversold", 30.0))
-            | (df["stoch_k"] < params.get("stoch_oversold", 20.0))
-        )
-        & (
-            (df["vwap_deviation"] < -params.get("vwap_threshold", 0.005))
-            | (df["close"] < df["bollinger_lower"])
-            | ((df["macd"] - df["macd_signal"]) < -params.get("macd_threshold", 0.01))
-        )
-    )
-    sell_signals = (
-        (df["volume_z"] > params.get("volume_z_threshold", 1.0))
-        & (
-            (df["rsi"] > params.get("rsi_overbought", 70.0))
-            | (df["stoch_k"] > params.get("stoch_overbought", 80.0))
-        )
-        & (
-            (df["vwap_deviation"] > params.get("vwap_threshold", 0.005))
-            | (df["close"] > df["bollinger_upper"])
-            | ((df["macd"] - df["macd_signal"]) > params.get("macd_threshold", 0.01))
-        )
-    )
-    # Логування кількості сигналів
-    from .core import logger
 
-    logger.debug(
-        f"Buy signals: {buy_signals.sum()}, Sell signals: {sell_signals.sum()} for backtest"
-    )
+    # Додаємо стовпці для сигналів
+    df["buy_signal"] = False
+    df["sell_signal"] = False
+    df["confidence"] = 0.0
+    df["factors"] = ""
+
+    # Визначаємо сигнали
+    for i, row in df.iterrows():
+        # Покупка
+        buy_valid, buy_conf, buy_factors = calculate_signal_strength(row, params, "buy")
+        if buy_valid:
+            df.at[i, "buy_signal"] = True
+            df.at[i, "confidence"] = buy_conf
+            df.at[i, "factors"] = buy_factors
+
+        # Продаж
+        sell_valid, sell_conf, sell_factors = calculate_signal_strength(
+            row, params, "sell"
+        )
+        if sell_valid:
+            df.at[i, "sell_signal"] = True
+            df.at[i, "confidence"] = max(df.at[i, "confidence"], sell_conf)
+            df.at[i, "factors"] = (
+                sell_factors
+                if not buy_valid
+                else f"{df.at[i, 'factors']}|{sell_factors}"
+            )
+
+    # Fallback на MACD якщо немає основних сигналів
+    macd_fallback = params.get("macd_fallback", True)
+    if macd_fallback:
+        macd_diff = df["macd"] - df["macd_signal"]
+        macd_threshold = params.get("macd_threshold", 0.01)
+
+        macd_buy = (macd_diff > macd_threshold) & ~df["buy_signal"]
+        macd_sell = (macd_diff < -macd_threshold) & ~df["sell_signal"]
+
+        # Застосовуємо тільки якщо є підтвердження іншими факторами
+        for i in df.index[macd_buy]:
+            if df.at[i, "confidence"] > 0.4:  # Мінімальна довіра
+                df.at[i, "buy_signal"] = True
+                df.at[i, "factors"] += (
+                    "|macd_fallback" if df.at[i, "factors"] else "macd_fallback"
+                )
+
+        for i in df.index[macd_sell]:
+            if df.at[i, "confidence"] > 0.4:
+                df.at[i, "sell_signal"] = True
+                df.at[i, "factors"] += (
+                    "|macd_fallback" if df.at[i, "factors"] else "macd_fallback"
+                )
+
+    # Симуляція торгів
     position = None
     trade_log = []
-    for i in range(len(df)):
-        row = df.iloc[i]
+
+    for i, row in df.iterrows():
+        current_time = row["timestamp"]
+
+        # Закриття позиції
         if position:
             current_price = row["close"]
             close_position = False
             close_reason = ""
+
             if position["direction"] == "buy":
                 if current_price >= position["tp"]:
                     close_position = True
@@ -69,6 +204,7 @@ def run_backtest(
                 elif current_price <= position["sl"]:
                     close_position = True
                     close_reason = "SL"
+
             elif position["direction"] == "sell":
                 if current_price <= position["tp"]:
                     close_position = True
@@ -76,71 +212,72 @@ def run_backtest(
                 elif current_price >= position["sl"]:
                     close_position = True
                     close_reason = "SL"
-            if (row["timestamp"] - position["entry_time"]).days > 1:
+
+            # Тайм-аут (макс 1 день)
+            if (current_time - position["entry_time"]).days > 0:
                 close_position = True
                 close_reason = "Time Exit"
+
             if close_position:
-                pnl = (current_price - position["entry_price"]) / position[
+                # Розрахунок PnL
+                pnl_pct = (current_price - position["entry_price"]) / position[
                     "entry_price"
                 ]
                 if position["direction"] == "sell":
-                    pnl = -pnl
+                    pnl_pct = -pnl_pct
+
                 trade_result = {
-                    "exit_time": row["timestamp"],
+                    "exit_time": current_time,
                     "exit_price": current_price,
-                    "pnl": pnl,
+                    "pnl": pnl_pct,
                     "close_reason": close_reason,
-                    "duration": (
-                        row["timestamp"] - position["entry_time"]
-                    ).total_seconds()
+                    "duration": (current_time - position["entry_time"]).total_seconds()
                     / 60,
                 }
                 trade_log.append({**position, **trade_result})
                 position = None
+
+        # Відкриття нової позиції
         if not position:
-            confidence = (
-                calculate_confidence(row, params, "buy")
-                if buy_signals.iloc[i]
-                else (
-                    calculate_confidence(row, params, "sell")
-                    if sell_signals.iloc[i]
-                    else 0.0
-                )
-            )
-            direction = (
-                "buy"
-                if buy_signals.iloc[i]
-                else ("sell" if sell_signals.iloc[i] else None)
-            )
-            if direction and confidence >= params.get("min_confidence", 0.7):
+            min_confidence = params.get("min_confidence", 0.65)
+
+            if row["buy_signal"] and row["confidence"] >= min_confidence:
+                direction = "buy"
+            elif row["sell_signal"] and row["confidence"] >= min_confidence:
+                direction = "sell"
+            else:
+                direction = None
+
+            if direction:
                 entry_price = row["close"]
                 atr = row["atr"]
+
+                # Адаптивні TP/SL на основі ATR та волатильності
+                tp_mult = params.get("tp_mult", 1.5)
+                sl_mult = params.get("sl_mult", 1.0)
+
+                # Корекція для низької волатильності
+                volatility_factor = max(1.0, atr / (entry_price * 0.005))
+
                 if direction == "buy":
-                    tp = entry_price + params["tp_mult"] * atr
-                    sl = entry_price - params["sl_mult"] * atr
+                    tp = entry_price + tp_mult * atr * volatility_factor
+                    sl = entry_price - sl_mult * atr * volatility_factor
                 else:
-                    tp = entry_price - params["tp_mult"] * atr
-                    sl = entry_price + params["sl_mult"] * atr
+                    tp = entry_price - tp_mult * atr * volatility_factor
+                    sl = entry_price + sl_mult * atr * volatility_factor
+
                 position = {
-                    "entry_time": row["timestamp"],
+                    "entry_time": current_time,
                     "entry_price": entry_price,
                     "direction": direction,
                     "tp": tp,
                     "sl": sl,
-                    "confidence": confidence,
+                    "confidence": row["confidence"],
                     "symbol": symbol,
                     "timeframe": timeframe,
+                    "factors": row["factors"],
                 }
-    for trade in trade_log:
-        entry_idx = df.index[df["timestamp"] == trade["entry_time"]][0]
-        trade["factors"] = {
-            "volume_z": df.loc[entry_idx, "volume_z"],
-            "rsi": df.loc[entry_idx, "rsi"],
-            "vwap_deviation": df.loc[entry_idx, "vwap_deviation"],
-            "atr": df.loc[entry_idx, "atr"],
-            "macd": df.loc[entry_idx, "macd"] - df.loc[entry_idx, "macd_signal"],
-            "stoch_k": df.loc[entry_idx, "stoch_k"],
-        }
+
     return trade_log
 
 

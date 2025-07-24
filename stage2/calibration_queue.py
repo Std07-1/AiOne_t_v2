@@ -27,86 +27,30 @@ import json
 # Внутрішні пакети
 from data.cache_handler import SimpleCacheHandler
 from stage2.calibration_engine import CalibrationEngine
+from stage2.calibration.calibration_config import CalibrationConfig
 from app.utils.metrics import MetricsCollector  # Новий модуль для метрик
+
+from rich.console import Console
+from rich.logging import RichHandler
 
 # ─────────────────── Налаштування логування ────────────────────
 log = logging.getLogger("calib_queue")
-log.setLevel(logging.DEBUG)  # Змінено на DEBUG для детальнішого логування
-
-_handler = logging.StreamHandler()
-_handler.setFormatter(
-    logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-)
-if not log.handlers:
-    log.addHandler(_handler)
+log.setLevel(logging.DEBUG)
+log.handlers.clear()
+log.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 log.propagate = False  # ← Критично важливо!
 
 # Константи для Circuit Breaker
 MAX_ATTEMPTS = 3  # Максимальна кількість спроб калібрування
 CIRCUIT_BREAKER_TIMEOUT = 600  # 10 хвилин
 
-DEFAULT_ASSET_CLASS = "spot"
-ASSET_CLASS_MAPPING = {
-    "spot": [
-        ".*BTC.*",
-        ".*ETH.*",
-        ".*XRP.*",
-        ".*LTC.*",
-        ".*BCH.*",
-        ".*DOT.*",
-        ".*SOL.*",
-        ".*ADA.*",
-        ".*LINK.*",
-        ".*TRX.*",
-    ],
-    "futures": [
-        ".*BTCUSD.*",
-        ".*ETHUSD.*",
-        ".*XRPUSD.*",
-        ".*LTCUSD.*",
-        ".*BCHUSD.*",
-        ".*DOTUSD.*",
-        ".*SOLUSD.*",
-        ".*ADAUSD.*",
-        ".*LINKUSD.*",
-        ".*TRXUSD.*",
-    ],
-    "meme": [
-        ".*MEME.*",
-        ".*DOGE.*",
-        ".*SHIB.*",
-        ".*PEPE.*",
-        ".*FLOKI.*",
-        ".*BONK.*",
-        ".*WIF.*",
-    ],
-    "defi": [
-        ".*UNI.*",
-        ".*AAVE.*",
-        ".*COMP.*",
-        ".*MKR.*",
-        ".*CRV.*",
-        ".*SUSHI.*",
-        ".*YFI.*",
-        ".*LDO.*",
-        ".*RUNE.*",
-    ],
-    "nft": [".*APE.*", ".*SAND.*", ".*MANA.*", ".*BLUR.*", ".*RARI.*"],
-    "metaverse": [".*ENJ.*", ".*AXS.*", ".*GALA.*", ".*ILV.*", ".*HIGH.*"],
-    "ai": [".*AGIX.*", ".*FET.*", ".*OCEAN.*", ".*RNDR.*", ".*AKT.*"],
-    "stable": [".*USDT$", ".*BUSD$", ".*DAI$", ".*USD$", ".*FDUSD$"],
-}
+DEFAULT_ASSET_CLASS = "futures"  # Дефолтний клас активів
 
 
 class AssetClassConfig:
-    def __init__(
-        self, mapping: Dict[str, list], patterns: Dict[str, list[re.Pattern]] = None
-    ):
+    def __init__(self, mapping: Dict[str, list]):
         self.mapping = mapping
-        self.compiled_patterns = patterns or self._compile_patterns(mapping)
+        self.compiled_patterns = self._compile_patterns(mapping)
 
     def _compile_patterns(
         self, mapping: Dict[str, list]
@@ -125,6 +69,11 @@ class AssetClassConfig:
                 if pattern.search(symbol):
                     return asset_class
         return None
+
+    async def update_calibration_status(self, symbol: str, status: str):
+        if symbol in self.state:
+            self.state[symbol]["calib_status"] = status
+            self.state[symbol]["last_updated"] = datetime.utcnow().isoformat()
 
 
 class CalibrationTask(NamedTuple):
@@ -145,115 +94,44 @@ class CalibrationQueue:
 
     def __init__(
         self,
+        config: CalibrationConfig,
         cache: SimpleCacheHandler,
         calib_engine: CalibrationEngine,
-        max_concurrent: int = 3,
         metrics: Optional[MetricsCollector] = None,
-        config_path: str = None,
-        defaults_dir: str = None,
-        asset_class_config: Optional[AssetClassConfig] = None,
         state_manager: Optional[Any] = None,
     ) -> None:
         self._cache = cache
         self._engine = calib_engine
-        self._config = self._load_config(
-            config_path
-            or os.path.join(os.path.dirname(__file__), "conf", "calibration_queue.json")
-        )
-        self._defaults_dir = defaults_dir or os.path.join(
-            os.path.dirname(__file__), "conf", "defaults"
-        )
-        self._defaults_cache = {}
-        self._sem = asyncio.Semaphore(
-            self._config.get("max_concurrent", max_concurrent)
-        )
+        self.config = config
+        self._sem = asyncio.Semaphore(config.max_concurrent)
         self._queue = asyncio.PriorityQueue()
         self._workers = []
         self._metrics = metrics or MetricsCollector()
         self._failure_count = defaultdict(int)
         self._circuit_breaker = {}
-        self.asset_class_config = asset_class_config or self._load_asset_class_config()
-        self._state_manager = state_manager  # Додаємо state_manager, може бути None
-        self.alert_symbols = set()  # Для ALERT-пріоритезації
-        self.max_concurrent = max_concurrent
+
+        # Використовуємо asset_class_mapping з конфігу
+        self.asset_class_config = AssetClassConfig(config.asset_class_mapping)
+
+        self._state_manager = state_manager
+        self.alert_symbols = set()
+
         self.default_calib_count = 0
+
         # Ініціалізація базових метрик
         self._metrics.gauge("queue_size", 0)
         self._metrics.gauge("active_workers", 0)
         self._metrics.gauge("circuit_breaker_active", 0)
         log.info(
-            f"[init] CalibrationQueue id={id(self)} created. Engine={self._engine}, max_concurrent={max_concurrent}"
+            f"CalibrationQueue created. Max concurrent: {config.max_concurrent}, "
+            f"Default trials: {config.n_trials}, Lookback days: {config.lookback_days}"
         )
-
-    @staticmethod
-    def _load_config(config_path: str) -> dict:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log.warning(f"Не вдалося завантажити конфігурацію: {e}")
-            return {}
-
-    def _load_asset_class_config(self) -> AssetClassConfig:
-        config_path = os.path.join(
-            os.path.dirname(__file__), "conf", "asset_classes.json"
-        )
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                custom_mapping = json.load(f)
-                log.info("Завантажено кастомну конфігурацію класів активів")
-                return AssetClassConfig(custom_mapping)
-        except FileNotFoundError:
-            log.info("Використовується дефолтна конфігурація класів активів")
-            return AssetClassConfig(ASSET_CLASS_MAPPING)
-        except Exception as e:
-            log.error(f"Помилка завантаження конфігурації класів активів: {e}")
-            return AssetClassConfig(ASSET_CLASS_MAPPING)
 
     def _get_asset_class(self, symbol: str) -> str:
+        """Визначає клас активу на основі конфігурації"""
         if matched_class := self.asset_class_config.match_symbol(symbol):
             return matched_class
-        symbol = symbol.upper()
-        if symbol.endswith("USD") or symbol.endswith("USDT") or symbol.endswith("BUSD"):
-            return "stable"
-        if (
-            symbol.endswith("MEME")
-            or symbol.endswith("DOGE")
-            or symbol.endswith("SHIB")
-        ):
-            return "meme"
-        if symbol.endswith("UNI") or symbol.endswith("AAVE") or symbol.endswith("COMP"):
-            return "defi"
-        if symbol.endswith("APE") or symbol.endswith("SAND") or symbol.endswith("MANA"):
-            return "nft"
-        if symbol.endswith("ENJ") or symbol.endswith("AXS") or symbol.endswith("GALA"):
-            return "metaverse"
-        return DEFAULT_ASSET_CLASS
-
-    def _load_defaults(self, asset_class: str) -> dict:
-        if asset_class in self._defaults_cache:
-            return self._defaults_cache[asset_class]
-        path = os.path.join(self._defaults_dir, f"{asset_class}.json")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                defaults = json.load(f)
-                self._defaults_cache[asset_class] = defaults
-                return defaults
-        except FileNotFoundError:
-            log.warning(
-                f"Файл дефолтів для {asset_class} не знайдено, використовую резервні"
-            )
-            self.default_calib_count += 1
-            defaults = {
-                "lookback_days": 20,
-                "n_trials": 12,
-                "volatility_threshold": 0.01,
-            }
-            self._defaults_cache[asset_class] = defaults
-            return defaults
-        except Exception as e:
-            log.warning(f"Не вдалося завантажити дефолти для {asset_class}: {e}")
-            return {}
+        return DEFAULT_ASSET_CLASS  # Використовуємо за замовчуванням
 
     # ──────────────────── Публічний API ────────────────────────
     async def put(
@@ -276,6 +154,11 @@ class CalibrationQueue:
         # Перевірка наявності символу та таймфрейму
         if not symbol or not tf:
             log.error("❌ Невірний символ або таймфрейм")
+            return
+
+        # Перевірка на circuit breaker
+        if self._is_circuit_broken(symbol):
+            log.warning(f"[put] Circuit breaker active for {symbol}, skipping")
             return
 
         # Збільшуємо пріоритет для термінових завдань
@@ -314,7 +197,7 @@ class CalibrationQueue:
             if is_urgent and not found_task.is_urgent:
                 log.info(f"🆙 Оновлюємо пріоритет для {symbol}/{tf} (термінове)")
                 new_task = found_task._replace(
-                    priority=0.1,
+                    priority=1.0,  # Максимальний пріоритет для термінових
                     is_urgent=True,
                     is_high_priority=True,
                     created_at=current_time,
@@ -490,24 +373,29 @@ class CalibrationQueue:
             await asyncio.sleep(30)
 
     def _calculate_ttl(self, symbol: str) -> int:
-        """Визначає TTL на основі типу активу та ринкових умов"""
+        """Визначає TTL на основі типу активу та волатильності"""
         asset_class = self._get_asset_class(symbol)
         volatility = self._get_symbol_volatility(symbol)
 
-        # Зменшення TTL для волатильних активів
-        if volatility > 40:
-            return 1800  # 30 хвилин
-
-        # Стандартні значення
-        ttl_map = {
+        # Базові значення TTL з конфігу
+        base_ttl = {
             "meme": 3600,
             "ai": 5400,
             "nft": 7200,
             "defi": 10800,
             "spot": 14400,
             "futures": 18000,
-        }
-        return ttl_map.get(asset_class, 7200)
+        }.get(asset_class, 7200)
+
+        # Коригування TTL на основі волатильності
+        if volatility > 40:
+            return max(
+                1800, int(base_ttl * 0.5)
+            )  # Скорочуємо TTL для волатильних активів
+        elif volatility < 15:
+            return min(28800, int(base_ttl * 1.5))  # Збільшуємо для стабільних
+
+        return base_ttl
 
     async def _safe_worker(self) -> None:
         """Воркер з обробкою помилок та повторними спробами."""
@@ -730,38 +618,93 @@ class CalibrationQueue:
     def _get_dynamic_params(
         self, symbol: str, is_high_priority: bool = False, is_urgent: bool = False
     ) -> Dict[str, Any]:
-        # Оптимізований режим для швидких/ALERT задач
-        if is_urgent:
-            base_config = {"lookback_days": 7, "n_trials": 8, "result_ttl": 1800}
-            return base_config
-        asset_class = self._get_asset_class(symbol)
-        defaults = self._load_defaults(asset_class)
+        """Генерує динамічні параметри калібрування на основі:
+        - Конфігурації системи
+        - Типу активу
+        - Волатильності
+        - Пріоритету завдання
+        """
+        # Базові параметри з конфігу
         base_config = {
-            "lookback_days": 20 if is_high_priority else 15,
-            "n_trials": 15 if is_high_priority else 10,
-            "result_ttl": 1800,
+            "lookback_days": self.config.lookback_days,
+            "n_trials": self.config.n_trials,
+            "result_ttl": self._calculate_ttl(symbol),
         }
+
+        # Отримуємо клас активу для додаткової адаптації
+        asset_class = self._get_asset_class(symbol)
+
+        # Адаптація на основі пріоритету завдання
+        if is_urgent:
+            # Швидкий режим для термінових завдань
+            base_config.update(
+                {
+                    "n_trials": max(15, int(self.config.n_trials * 0.6)),
+                    "lookback_days": max(10, int(self.config.lookback_days * 0.7)),
+                }
+            )
+        elif is_high_priority:
+            # Оптимізований режим для високопріоритетних завдань
+            base_config.update(
+                {
+                    "n_trials": int(self.config.n_trials * 0.8),
+                    "lookback_days": int(self.config.lookback_days * 0.9),
+                }
+            )
+
+        # Адаптація на основі волатильності
         volatility = self._get_symbol_volatility(symbol)
-        return self._adjust_params_by_volatility(base_config, volatility)
+        base_config = self._adjust_params_by_volatility(base_config, volatility)
+
+        # Адаптація на основі класу активу
+        if asset_class == "meme":
+            base_config["n_trials"] = min(30, base_config["n_trials"])
+            base_config["lookback_days"] = min(15, base_config["lookback_days"])
+        elif asset_class == "stable":
+            base_config["n_trials"] = max(10, int(base_config["n_trials"] * 0.5))
+
+        return base_config
 
     def _adjust_params_by_volatility(
         self, params: Dict[str, Any], volatility: float
     ) -> Dict[str, Any]:
+        """Адаптує параметри калібрування на основі волатильності"""
         adjusted = params.copy()
-        if volatility > 50:
-            adjusted["n_trials"] = min(60, int(params["n_trials"] * 1.5))
-            adjusted["lookback_days"] = max(7, int(params["lookback_days"] * 0.7))
-        elif volatility > 30:
-            adjusted["n_trials"] = min(45, int(params["n_trials"] * 1.2))
-        elif volatility < 10:
-            adjusted["n_trials"] = max(10, int(params["n_trials"] * 0.8))
-            adjusted["lookback_days"] = min(60, int(params["lookback_days"] * 1.3))
+
+        if volatility > 50:  # Висока волатильність
+            adjusted.update(
+                {
+                    "n_trials": min(60, int(params["n_trials"] * 1.5)),
+                    "lookback_days": max(7, int(params["lookback_days"] * 0.7)),
+                }
+            )
+        elif volatility > 30:  # Середня волатильність
+            adjusted.update({"n_trials": min(45, int(params["n_trials"] * 1.2))})
+        elif volatility < 10:  # Низька волатильність
+            adjusted.update(
+                {
+                    "n_trials": max(10, int(params["n_trials"] * 0.8)),
+                    "lookback_days": min(60, int(params["lookback_days"] * 1.3)),
+                }
+            )
+
         return adjusted
 
     def _get_symbol_volatility(self, symbol: str) -> float:
-        """Заглушка для отримання волатильності символу."""
-        # Реальна реалізація вимагає підключення до ринкових даних
-        return 25.0  # Приклад значення
+        """Заглушка для отримання волатильності символу (реалізація залежить від джерела даних)"""
+        # TODO: Інтегрувати з реальним джерелом даних
+        # Тимчасові значення на основі класу активу
+        asset_class = self._get_asset_class(symbol)
+        volatility_map = {
+            "meme": 45.0,
+            "ai": 35.0,
+            "nft": 30.0,
+            "defi": 25.0,
+            "spot": 20.0,
+            "futures": 40.0,
+            "stable": 5.0,
+        }
+        return volatility_map.get(asset_class, 25.0)
 
     def _is_circuit_broken(self, symbol: str) -> bool:
         """Перевіряє чи активний circuit breaker для символу."""
@@ -776,7 +719,7 @@ class CalibrationQueue:
     # ──────────────── Утиліти та моніторинг ────────────────────
     @staticmethod
     def _redis_key(symbol: str, tf: str) -> str:
-        return f"calib_v2:{symbol}:{tf}"
+        return f"calib:{symbol}:{tf}"
 
     async def get_cached(self, symbol: str, tf: str) -> Optional[Dict[str, Any]]:
         """Перевіряє кеш з автоматичною інвалідацією."""

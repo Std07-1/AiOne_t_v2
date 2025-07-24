@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime, timedelta
+from typing import Optional
 
 from redis.asyncio import Redis
 import subprocess
@@ -20,8 +21,6 @@ import aiohttp
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 # ─────────────────────────── Імпорти бізнес-логіки ───────────────────────────
 from data.cache_handler import SimpleCacheHandler
@@ -31,7 +30,7 @@ from data.ws_worker import WSWorker
 from data.ram_buffer import RAMBuffer
 
 from stage1.asset_monitoring import AssetMonitorStage1
-from app.screening_producer import screening_producer
+from app.screening_producer import screening_producer, publish_full_state
 from UI.ui_consumer import UI_Consumer
 from stage1.optimized_asset_filter import get_filtered_assets
 from stage3.trade_manager import TradeLifecycleManager
@@ -40,14 +39,13 @@ from app.settings import settings
 from rich.console import Console
 from rich.logging import RichHandler
 from .utils.metrics import MetricsCollector
-from app.calibration_queue import CalibrationQueue, AssetClassConfig
+from stage2.calibration_queue import CalibrationQueue, AssetClassConfig
 from app.screening_producer import AssetStateManager
+from stage2.config import STAGE2_CONFIG
+from stage2.calibration.calibration_config import CalibrationConfig
 
 # Завантажуємо налаштування з .env
 load_dotenv()
-
-# Глобальний Redis-кеш, ініціалізується при старті
-cache_handler: SimpleCacheHandler
 
 # --- Логування ---
 main_logger = logging.getLogger("main")
@@ -60,6 +58,12 @@ main_logger.propagate = False  # ← Критично важливо!
 # Створюємо FastAPI-додаток
 app = FastAPI()
 router = APIRouter()
+
+# Глобальний Redis-кеш, ініціалізується при старті
+cache_handler: SimpleCacheHandler
+
+# Додаємо оголошення глобальної змінної calib_queue
+global calib_queue
 
 # Шлях до кореня проекту
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -383,12 +387,13 @@ async def run_pipeline() -> None:
     4. Запуск скринінгу (screening_producer) для stage1
     5. (Опційно) запуск UI/live-stats/fastapi
     """
-    global calib_queue
 
     # 1. Ініціалізація
     cache = await init_system()
     file_manager = FileManager()
     buffer = RAMBuffer(max_bars=120)
+    calibration_config = CalibrationConfig()
+    stage2_config = STAGE2_CONFIG
 
     # Підключення до Redis
     redis_conn = Redis(
@@ -408,8 +413,6 @@ async def run_pipeline() -> None:
         "MIN_OPEN_INTEREST": 500_000.0,
         "MAX_SYMBOLS": 350,
     }
-    # Додаємо оголошення глобальної змінної calib_queue
-    global calib_queue
 
     # 2. Створюємо довгоживу ClientSession
     session = aiohttp.ClientSession()
@@ -417,7 +420,7 @@ async def run_pipeline() -> None:
         fetcher = OptimizedDataFetcher(cache_handler=cache, session=session)
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
-        use_manual_list = False  # Змінити на False для автоматичного режиму
+        use_manual_list = True  # Змінити на False для автоматичного режиму
 
         if use_manual_list:
             # Ручний режим: використовуємо фіксований список
@@ -432,10 +435,12 @@ async def run_pipeline() -> None:
                 "xrpusdt",
             ]
             await cache.set_fast_symbols(fast_symbols, ttl=3600)
-            main_logger.info(f"Використовуємо ручний список символів: {fast_symbols}")
+            main_logger.info(
+                f"[Main] Використовуємо ручний список символів: {fast_symbols}"
+            )
         else:
             # Автоматичний режим: виконуємо первинний префільтр
-            main_logger.info("Запускаємо первинний префільтр...")
+            main_logger.info("[Main] Запускаємо первинний префільтр...")
             # Використовуємо новий механізм відбору активів
             fast_symbols = await get_filtered_assets(
                 session=session,
@@ -450,49 +455,59 @@ async def run_pipeline() -> None:
             )
             fast_symbols = [s.lower() for s in fast_symbols]
             await cache.set_fast_symbols(fast_symbols, ttl=600)
-            main_logger.info(f"Первинний префільтр: {len(fast_symbols)} символів")
+            main_logger.info(
+                f"[Main] Первинний префільтр: {len(fast_symbols)} символів"
+            )
 
         # Отримуємо актуальний список символів
         fast_symbols = await cache.get_fast_symbols()
         if not fast_symbols:
-            main_logger.error("Не вдалося отримати список символів. Завершення.")
+            main_logger.error("[Main] Не вдалося отримати список символів. Завершення.")
             return
 
         main_logger.info(
-            f"Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
+            f"[Main] Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
         )
         # ===== КІНЕЦЬ НОВОЇ ЛОГІКИ =====
 
         # Preload історії
-        await preload_1m_history(fetcher, fast_symbols, buffer, lookback=500)
+        await preload_1m_history(
+            fetcher, fast_symbols, buffer, lookback=500
+        )  # 500 барів (~8.3 години)
         daily_data = await preload_daily_levels(fetcher, fast_symbols, days=30)
 
         # --- CalibrationEngine ---
-        main_logger.info("Ініціалізуємо CalibrationEngine...")
+        main_logger.info("[Main] Ініціалізуємо CalibrationEngine...")
         calib_engine = CalibrationEngine(
-            ram_buffer=buffer,
-            fetcher=fetcher,
-            redis_client=redis_conn,
-            interval="1m",
-            min_bars=50,
-            metric="profit_factor",
+            config=calibration_config,
+            stage2_config=stage2_config,
+            ram_buffer=buffer,  # Використовуємо RAMBuffer для історії
+            fetcher=fetcher,  # Оптимізований фетчер
+            redis_client=redis_conn,  # Підключення до Redis
+            interval="1m",  # Таймфрейм для аналізу
+            min_bars=350,  # Мінімальна кількість барів для аналізу
+            metric="profit_factor",  # Метрика для калібрування
         )
 
         # --- CalibrationQueue ---
-        main_logger.info("Ініціалізуємо CalibrationQueue...")
+        main_logger.info("[Main] Ініціалізуємо CalibrationQueue...")
         # Ініціалізуємо AssetStateManager для коректної інтеграції зі станом активів
         assets_current = [s.lower() for s in fast_symbols]
         state_manager = AssetStateManager(assets_current)
         calib_queue = CalibrationQueue(
+            config=CalibrationConfig(
+                n_trials=25,  # Ще менше спроб для швидкості
+                lookback_days=14,  # 7 днів історії
+                max_concurrent=15,  # Більше паралельних задач
+            ),
             cache=cache,
             calib_engine=calib_engine,
-            max_concurrent=15,
             state_manager=state_manager,
         )
         await calib_queue.start_workers(n_workers=20)  # Збільшуємо кількість воркерів
 
         # Ініціалізація AssetMonitorStage1
-        main_logger.info("Ініціалізуємо AssetMonitorStage1...")
+        main_logger.info("[Main] Ініціалізуємо AssetMonitorStage1...")
         monitor = AssetMonitorStage1(
             cache_handler=cache,
             vol_z_threshold=2.5,
@@ -509,11 +524,11 @@ async def run_pipeline() -> None:
         )
 
         # Ініціалізуємо UI-споживача
-        main_logger.info("Ініціалізуємо UI-споживача...")
-        ui = UI_Consumer(vol_z_threshold=2.5)
+        main_logger.info("[Main] Ініціалізуємо UI-споживача...")
+        ui = UI_Consumer()
 
         # Запускаємо Screening Producer
-        main_logger.info("Запускаємо Screening Producer...")
+        main_logger.info("[Main] Запускаємо Screening Producer...")
         prod = asyncio.create_task(
             screening_producer(
                 monitor,
@@ -532,6 +547,13 @@ async def run_pipeline() -> None:
                 state_manager=state_manager,
             )
         )
+
+        # Публікуємо початковий стан в Redis
+        main_logger.info("[Main] Публікуємо початковий стан в Redis...")
+        await publish_full_state(state_manager, cache, redis_conn)
+
+        # Запускаємо TradeLifecycleManager для управління угодами
+        main_logger.info("[Main] Запускаємо TradeLifecycleManager...")
         trade_update_task = asyncio.create_task(
             trade_manager_updater(
                 trade_manager,
@@ -573,7 +595,6 @@ async def run_pipeline() -> None:
 @router.get("/metrics")
 async def metrics_endpoint():
     # calib_queue має бути глобально доступний або імпортований
-    global calib_queue
     metrics = calib_queue.get_metrics()
     output = []
     # Лічильники

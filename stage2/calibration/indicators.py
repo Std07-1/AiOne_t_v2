@@ -98,6 +98,11 @@ def calculate_indicators(df: pd.DataFrame, custom_periods: dict = None) -> pd.Da
     # --- EMA ---
     df["ema20"] = df["close"].ewm(span=20, min_periods=1, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, min_periods=1, adjust=False).mean()
+
+    df["ma_50"] = df["close"].rolling(window=50, min_periods=1).mean()
+    df["ma_200"] = df["close"].rolling(window=200, min_periods=1).mean()
+    # high, low, open — вже мають бути з джерела, але перевірити.
+
     # --- Смуги Боллінджера (Bollinger Bands) ---
     df["sma20"] = df["close"].rolling(window=20, min_periods=1).mean()
     df["std20"] = df["close"].rolling(window=20, min_periods=1).std()

@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 import os
+import time
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 import optuna
+import warnings
 from optuna.samplers import TPESampler
 from .calibration.indicators import calculate_indicators
 from .calibration.backtest import run_backtest, calculate_summary
@@ -18,12 +20,30 @@ from .calibration.calibration import (
     safe_metric_value,
 )
 from .calibration.data import load_data
-from .calibration.utils import unify_stage2_params
 
-from stage2.config import STAGE2_CONFIG
+from stage2.calibration.calibration_config import CalibrationConfig
 
 # Налаштування логування
-from .calibration.core import logger  # Замість локального створення
+logger = logging.getLogger("calibration_module")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.propagate = False
+
+from optuna.exceptions import ExperimentalWarning
+
+# Ігнорувати попередження про multivariate
+warnings.filterwarnings("ignore", category=ExperimentalWarning)
+
+from optuna.logging import set_verbosity
+
+# Вимкнути всі логи Optuna
+set_verbosity(optuna.logging.WARNING)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+# Або ще сильніше - вимкнути повністю
+# optuna.logging.disable_default_handler()
 
 
 class CalibrationEngine:
@@ -34,24 +54,60 @@ class CalibrationEngine:
 
     def __init__(
         self,
-        fetcher: Any,
-        redis_client,
+        config: CalibrationConfig,  # Конфігурація калібрування
+        stage2_config: dict,  # Налаштування Stage2
+        fetcher: Any,  # Оптимізований фетчер для отримання даних
+        redis_client,  # Підключення до Redis
         ram_buffer,  # Об'єднаний буфер для даних
-        interval: str = "1m",
-        min_bars: int = 30,
-        metric: str = "profit_factor",
-        calib_queue: Optional[Any] = None,
+        interval: str = "1m",  # Таймфрейм для аналізу
+        min_bars: int = 350,  # Визначено у main.py (рядок 485)
+        metric: str = "profit_factor",  # Метрика для калібрування
+        calib_queue: Optional[Any] = None,  # Черга калібрування для асинхронних завдань
     ):
-        self.fetcher = fetcher
-        self.interval = interval
-        self.min_bars = 500 if interval == "1m" else min_bars
-        self.redis = redis_client
-        self.ram_buffer = ram_buffer
-        self.metric = metric
-        self.calibration_results = {}
+        self.fetcher = fetcher  # Оптимізований фетчер для отримання даних
+        self.interval = interval  # Таймфрейм для аналізу
+        self.min_bars = min_bars  # Мінімальна кількість барів для аналізу
+        self.redis = redis_client  # Підключення до Redis для кешування результатів
+        self.ram_buffer = ram_buffer  # Об'єднаний буфер для швидкого доступу до історії
+        self.metric = metric  # Метрика для калібрування
+        self.calibration_results = (
+            {}
+        )  # Зберігає результати калібрування для кожного активу
         self.symbol_seeds = {}  # Унікальний seed для кожного символу
-        self.calib_queue = calib_queue
-        self.config = STAGE2_CONFIG
+        self.calib_queue = calib_queue  # Черга калібрування для асинхронних завдань
+        self.config = config  # Конфігурація калібрування
+        self.stage2_config = stage2_config  # STAGE2_CONFIG з config.py
+        self.circuit_breakers: Dict[str, float] = (
+            {}
+        )  # Зберігає активні circuit breakers для символів
+
+    def unify_stage2_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Гарантує, що словник містить всі уніфіковані ключі Stage2 з використанням конфігу.
+        Якщо є лише atr_multiplier — присвоює tp_mult і sl_mult.
+        Додає дефолтні значення для відсутніх ключів.
+        """
+        unified_keys = {
+            "volume_z_threshold": self.config.volume_z_threshold,
+            "tp_mult": self.config.tp_mult,
+            "sl_mult": self.config.sl_mult,
+            "min_confidence": self.config.min_confidence,
+            "rsi_oversold": self.config.rsi_oversold,
+            "rsi_overbought": self.config.rsi_overbought,
+            "vwap_threshold": self.config.vwap_threshold,
+            "macd_threshold": self.config.macd_threshold,
+            "stoch_oversold": self.config.stoch_oversold,
+            "stoch_overbought": self.config.stoch_overbought,
+        }
+        # Якщо є лише atr_multiplier, присвоюємо tp_mult і sl_mult
+        if "atr_multiplier" in params:
+            params["tp_mult"] = params["sl_mult"] = params["atr_multiplier"]
+        result = {}
+        for k, v in unified_keys.items():
+            result[k] = float(params[k]) if k in params else v
+
+        # Мердж з вхідними параметрами
+        return {**unified_keys, **params}
 
     async def run_calibration_system(
         self,
@@ -135,6 +191,19 @@ class CalibrationEngine:
         config_template: Optional[Dict],
         override_old: bool,
     ) -> Dict[str, Any]:
+        """Асинхронне калібрування для одного символу та таймфрейму."""
+
+        if self._is_circuit_active(symbol, timeframe):
+            logger.warning(
+                f"⚡ Пропущено {symbol}/{timeframe} — активний circuit breaker"
+            )
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "error": "Circuit breaker active",
+                "calibration_time": datetime.utcnow().isoformat(),
+            }
+
         logger.info(f"🚀 Початок калібрування для {symbol} на {timeframe} таймфреймі")
         redis_key = f"calib:{symbol}:{timeframe}"
         if not override_old:
@@ -179,9 +248,9 @@ class CalibrationEngine:
             df = calculate_indicators(
                 df,
                 custom_periods={
-                    "rsi_period": 10,
-                    "volume_window": 30,
-                    "atr_period": 10,
+                    "rsi_period": self.stage2_config.get("rsi_period", 14),
+                    "volume_window": self.stage2_config.get("volume_window", 30),
+                    "atr_period": self.stage2_config.get("atr_period", 14),
                 },
             )
         except Exception as e:
@@ -228,6 +297,7 @@ class CalibrationEngine:
             lambda trial: objective(
                 trial,
                 df,
+                symbol,
                 config_template,
                 metric_weights=getattr(self, "metric_weights", None),
                 run_backtest_fn=run_backtest,
@@ -236,7 +306,7 @@ class CalibrationEngine:
                 min_trades=1,  # Дозволяємо trial з 1-2 трейдами
             ),
             n_trials=n_trials,
-            callbacks=[self.optimization_callback],  # Закоментувати цей рядок
+            callbacks=[self.optimization_callback],  # Закоментувати цей рядок?
             show_progress_bar=True,
         )
 
@@ -332,7 +402,6 @@ class CalibrationEngine:
             symbol, timeframe, date_to, best_params
         )
 
-        # Додайте oos_metrics до результату
         result = {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -348,10 +417,40 @@ class CalibrationEngine:
             "seed": seed,
         }
 
+        # --- OOS-валідація з комбінованою метрикою ---
+        is_valid, reason = self.validate_oos(oos_metrics)
+        if not is_valid:
+            logger.warning(f"OOS валідація НЕ пройдена для {symbol}: {reason}")
+            self._trigger_circuit_breaker(symbol)
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "error": f"OOS validation failed: {reason}",
+                "circuit_breaker": True,
+                "oos_validation": oos_metrics,
+                "calibration_time": datetime.utcnow().isoformat(),
+            }
+
         # Збереження результатів у Redis
         await self.save_calibration_result(redis_key, result)
 
         return result
+
+    @staticmethod
+    def validate_oos(oos_metrics: dict) -> Tuple[bool, str]:
+        """
+        Перевіряє якість OOS-валідації за комбінованою метрикою.
+        Повертає (is_valid, reason).
+        """
+        min_trades = 1  # Мінімальна кількість трейдів для валідації
+
+        if oos_metrics.get("total_trades", 0) < min_trades:
+            return False, "Недостатньо трейдів для валідації"
+        # Комбінована метрика якості
+        win_rate = oos_metrics.get("win_rate", 0)
+        profit_factor = oos_metrics.get("profit_factor", 0)
+        quality_score = win_rate * 0.4 + profit_factor * 0.6
+        return quality_score > 0.5, f"Quality score: {quality_score:.2f}"
 
     async def get_calibration_result(self, redis_key: str) -> Optional[Dict]:
         """
@@ -398,9 +497,9 @@ class CalibrationEngine:
             oos_df = calculate_indicators(
                 oos_df,
                 custom_periods={
-                    "rsi_period": 10,
+                    "rsi_period": 14,
                     "volume_window": 30,
-                    "atr_period": 10,
+                    "atr_period": 14,
                 },
             )
             # Перевірка критичних колонок
@@ -414,158 +513,55 @@ class CalibrationEngine:
             oos_summary = calculate_summary(oos_trades)
             # Нормалізація OOS метрик
             return {
-                "sharpe": safe_metric_value(calculate_sharpe(oos_trades)),
-                "sortino": safe_metric_value(calculate_sortino(oos_trades)),
-                "profit_factor": safe_metric_value(
-                    oos_summary.get("profit_factor", 0.0)
+                "sharpe": safe_metric_value(
+                    calculate_sharpe(oos_trades, symbol), symbol=symbol
                 ),
-                "win_rate": safe_metric_value(oos_summary.get("win_rate", 0.0)),
+                "sortino": safe_metric_value(
+                    calculate_sortino(oos_trades, symbol), symbol=symbol
+                ),
+                "profit_factor": safe_metric_value(
+                    oos_summary.get("profit_factor", 0.0), symbol=symbol
+                ),
+                "win_rate": safe_metric_value(
+                    oos_summary.get("win_rate", 0.0), symbol=symbol
+                ),
                 "total_trades": len(oos_trades),
             }
         except Exception as e:
             logger.error(f"Помилка OOS валідації: {str(e)}")
             return {"error": f"Validation error: {str(e)}"}
 
-    def set_metric_weights(self, weights: Dict[str, float]):
+    def _trigger_circuit_breaker(
+        self, symbol: str, tf: str = "1m", cooldown: int = 900
+    ):
         """
-        Встановити ваги для метрик при оптимізації.
+        Активує circuit breaker для заданого символу й таймфрейму на певний час (за замовчуванням 15 хвилин).
         """
-        self.metric_weights = weights
+        key = f"{symbol}:{tf}"
+        self.circuit_breakers[key] = time.time() + cooldown
+        logger.warning(
+            f"🚨 Circuit breaker для {symbol}/{tf} активовано. Наступна спроба через {cooldown} сек."
+        )
 
-    def get_metric_weights(self) -> Dict[str, float]:
+    def _is_circuit_active(self, symbol: str, tf: str = "1m") -> bool:
         """
-        Отримати поточні ваги метрик.
+        Перевіряє, чи активний circuit breaker для символу.
         """
-        return getattr(self, "metric_weights", {})
+        key = f"{symbol}:{tf}"
+        if key in self.circuit_breakers:
+            if time.time() < self.circuit_breakers[key]:
+                return True
+            del self.circuit_breakers[key]  # Протермінований — видаляємо
+        return False
 
-    def set_param_ranges(self, ranges: Dict[str, Tuple[float, float]]):
-        """
-        Встановити діапазони параметрів для калібрування.
-        """
-        self.param_ranges = ranges
 
-    def get_param_ranges(self) -> Dict[str, Tuple[float, float]]:
-        """
-        Отримати поточні діапазони параметрів.
-        """
-        return getattr(self, "param_ranges", {})
+"""
+Ми маємо декілька модулів, які взаємодіють у процесі калібрування. Основні компоненти:
+1. `CalibrationEngine` (calibration_engine.py) - ядро калібрування, запускає оптимізацію за допомогою Optuna.
+2. `CalibrationQueue` (calibration_queue.py) - черга завдань калібрування з пріоритетами, управлінням воркерами та обмеженнями.
+3. `AssetStateManager` (screening_producer.py) - менеджер стану активів, який відстежує стан калібрування для кожного активу.
+4. `screening_producer` (screening_producer.py) - головний цикл, який ініціює калібрування для активів з ALERT-сигналами.
+5. `run_pipeline` (main.py) - головний пайплайн, який ініціалізує систему, запускає калібрувальну чергу та воркери.
+Також є допоміжні модулі для бектесту (`backtest.py`), розрахунку метрик (`calibration.py`), завантаження даних (`data.py`), тощо.
 
-    def set_additional_indicators(self, indicators: List[str]):
-        """
-        Встановити додаткові індикатори для обчислення під час калібрування.
-        """
-        self.additional_indicators = indicators
-
-    def get_additional_indicators(self) -> List[str]:
-        """
-        Отримати список додаткових індикаторів.
-        """
-        return getattr(self, "additional_indicators", [])
-
-    def set_logging_level(self, level: int):
-        """
-        Встановити рівень логування.
-        """
-        logger.setLevel(level)
-
-    def get_logging_level(self) -> int:
-        """
-        Отримати поточний рівень логування.
-        """
-        return logger.level
-
-    def set_calibration_mode(self, mode: str):
-        """
-        Встановити режим калібрування (наприклад, 'fast', 'full').
-        """
-        self.calibration_mode = mode
-
-    def get_calibration_mode(self) -> str:
-        """
-        Отримати поточний режим калібрування.
-        """
-        return getattr(self, "calibration_mode", "full")
-
-    def set_data_source(self, source: str):
-        """
-        Встановити джерело даних (наприклад, 'api', 'file').
-        """
-        self.data_source = source
-
-    def get_data_source(self) -> str:
-        """
-        Отримати поточне джерело даних.
-        """
-        return getattr(self, "data_source", "api")
-
-    def set_execution_mode(self, mode: str):
-        """
-        Встановити режим виконання (наприклад, 'live', 'backtest').
-        """
-        self.execution_mode = mode
-
-    def get_execution_mode(self) -> str:
-        """
-        Отримати поточний режим виконання.
-        """
-        return getattr(self, "execution_mode", "backtest")
-
-    def set_slippage_model(self, model: str):
-        """
-        Встановити модель сліппи (наприклад, 'none', 'fixed', 'variable').
-        """
-        self.slippage_model = model
-
-    def get_slippage_model(self) -> str:
-        """
-        Отримати поточну модель сліппи.
-        """
-        return getattr(self, "slippage_model", "none")
-
-    def set_commission_model(self, model: str):
-        """
-        Встановити модель комісії (наприклад, 'fixed', 'percentage').
-        """
-        self.commission_model = model
-
-    def get_commission_model(self) -> str:
-        """
-        Отримати поточну модель комісії.
-        """
-        return getattr(self, "commission_model", "fixed")
-
-    def set_order_type(self, order_type: str):
-        """
-        Встановити тип ордеру (наприклад, 'limit', 'market').
-        """
-        self.order_type = order_type
-
-    def get_order_type(self) -> str:
-        """
-        Отримати поточний тип ордеру.
-        """
-        return getattr(self, "order_type", "limit")
-
-    def set_timeframe_alignment(self, alignment: bool):
-        """
-        Встановити вирівнювання таймфреймів (True/False).
-        """
-        self.timeframe_alignment = alignment
-
-    def get_timeframe_alignment(self) -> bool:
-        """
-        Отримати поточне налаштування вирівнювання таймфреймів.
-        """
-        return getattr(self, "timeframe_alignment", True)
-
-    def set_max_drawdown(self, drawdown: float):
-        """
-        Встановити максимальний допустимий рівень просадки (drawdown) для стратегії.
-        """
-        self.max_drawdown = drawdown
-
-    def get_max_drawdown(self) -> float:
-        """
-        Отримати поточний рівень максимального drawdown.
-        """
-        return getattr(self, "max_drawdown", 0.0)
+"""

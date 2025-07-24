@@ -15,7 +15,7 @@ from rich.logging import RichHandler
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils_1_2 import _safe_float
-from app.calibration_queue import CalibrationQueue
+from stage2.calibration_queue import CalibrationQueue
 from stage2.market_analysis import stage2_consumer
 from utils.utils_1_2 import ensure_timestamp_column
 
@@ -149,6 +149,11 @@ def normalize_result_types(result: dict) -> dict:
         "open_interest",
         "btc_dependency_score",
     ]
+
+    if "calib_params" in result:
+        result["calib_params"] = {
+            k: float(v) for k, v in result["calib_params"].items()
+        }
 
     for field in numeric_fields:
         if field in result:
@@ -514,9 +519,9 @@ async def screening_producer(
                 asyncio.create_task(
                     calib_queue.put(
                         symbol=symbol,
-                        tf=timeframe,
+                        tf="1m",
+                        is_urgent=True,  # Позначка терміновості
                         priority=1.0,
-                        is_urgent=True,
                     )
                 )
                 for symbol in urgent_calib_tasks
@@ -593,7 +598,7 @@ async def screening_producer(
                                     await calib_queue.put(
                                         symbol=symbol,
                                         tf=timeframe,
-                                        priority=0.1,  # Максимальний пріоритет
+                                        priority=1.0,  # Максимальний пріоритет
                                         is_urgent=True,
                                         is_high_priority=True,
                                     )
@@ -614,6 +619,16 @@ async def screening_producer(
             logger.error(f"Критична помилка Stage1: {str(e)}")
 
         # --- Інтеграція Stage2 через Stage2Processor (новий модуль) ---
+
+        # Оновлення каліброваних параметрів
+        if calib_queue:
+            for symbol in ready_assets:
+                if cached_params := await calib_queue.get_cached(symbol, timeframe):
+                    await state_manager.update_calibration(symbol, cached_params)
+                    # Додатково активуємо подію (на випадок, якщо update_calibration не викликається ззовні)
+                    event = getattr(state_manager, "calibration_events", {}).get(symbol)
+                    if event:
+                        event.set()
 
         # Перевірка чи всі ALERT активи відкалібровані
         alert_signals = state_manager.get_alert_signals()
@@ -762,16 +777,6 @@ async def screening_producer(
                 state_manager.update_asset(symbol, update)
         else:
             logger.info("[Stage2] Немає сигналів ALERT для Stage2Processor")
-
-        # Оновлення каліброваних параметрів
-        if calib_queue:
-            for symbol in ready_assets:
-                if cached_params := await calib_queue.get_cached(symbol, timeframe):
-                    await state_manager.update_calibration(symbol, cached_params)
-                    # Додатково активуємо подію (на випадок, якщо update_calibration не викликається ззовні)
-                    event = getattr(state_manager, "calibration_events", {}).get(symbol)
-                    if event:
-                        event.set()
 
         # Публікація стану активів
         logger.info("📢 Публікація стану активів...")
