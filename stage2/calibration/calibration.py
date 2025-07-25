@@ -16,7 +16,7 @@ from rich.logging import RichHandler
 from rich.console import Console
 
 logger = logging.getLogger("calibration")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logger.handlers.clear()
 logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False

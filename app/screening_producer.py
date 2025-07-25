@@ -18,6 +18,7 @@ from utils.utils_1_2 import _safe_float
 from stage2.calibration_queue import CalibrationQueue
 from stage2.market_analysis import stage2_consumer
 from utils.utils_1_2 import ensure_timestamp_column
+from stage1.utils import format_volume_usd, format_open_interest
 
 
 # --- Налаштування логування ---
@@ -319,18 +320,57 @@ async def open_trades(
 async def publish_full_state(
     state_manager: AssetStateManager, cache_handler: Any, redis_conn: Any
 ) -> None:
-    """Публікує повний стан всіх активів в Redis"""
     try:
         all_assets = state_manager.get_all_assets()
-        serialized_assets = make_serializable_safe(all_assets)
+        serialized_assets = []
 
-        await cache_handler.set_json("asset_state", "global", serialized_assets, ttl=30)
+        for asset in all_assets:
+            # Конвертуємо всі числові поля у float
+            for key in ["tp", "sl", "rsi", "volume", "atr", "confidence"]:
+                if key in asset:
+                    try:
+                        asset[key] = (
+                            float(asset[key])
+                            if asset[key] not in [None, "", "NaN"]
+                            else 0.0
+                        )
+                    except (TypeError, ValueError):
+                        asset[key] = 0.0
 
-        redis_conn.publish(
+            # Форматуємо ціни в UI
+            if "stats" in asset and "current_price" in asset["stats"]:
+                asset["price_str"] = str(asset["stats"]["current_price"])
+
+            # Конвертуємо stats
+            if "stats" in asset:
+                for stat_key in [
+                    "current_price",
+                    "atr",
+                    "volume_mean",
+                    "open_interest",
+                    "rsi",
+                    "rel_strength",
+                    "btc_dependency_score",
+                ]:
+                    if stat_key in asset["stats"]:
+                        try:
+                            asset["stats"][stat_key] = (
+                                float(asset["stats"][stat_key])
+                                if asset["stats"][stat_key] not in [None, "", "NaN"]
+                                else 0.0
+                            )
+                        except (TypeError, ValueError):
+                            asset["stats"][stat_key] = 0.0
+
+            serialized_assets.append(asset)
+
+        # Публікуємо в Redis
+        await redis_conn.publish(
             "asset_state_update", json.dumps(serialized_assets, default=str)
         )
 
-        logger.info(f"✅ Опубліковано стан {len(all_assets)} активів")
+        logger.info(f"✅ Опубліковано стан {len(serialized_assets)} активів")
+
     except Exception as e:
         logger.error(f"Помилка публікації стану: {str(e)}")
 

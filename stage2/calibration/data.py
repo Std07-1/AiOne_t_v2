@@ -1,11 +1,15 @@
 import pandas as pd
 import logging
-from datetime import datetime
-from typing import Optional, Any, Dict
-import io
-import os
 
+from rich.console import Console
+from rich.logging import RichHandler
+
+# Налаштування логування
 logger = logging.getLogger("calibration.data")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+logger.propagate = False  # ← Критично важливо!
 
 
 async def load_data(fetcher, buffer, symbol, timeframe, date_from, date_to, min_bars):

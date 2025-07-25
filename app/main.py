@@ -4,7 +4,6 @@ app/main.py
 """
 
 import time
-import json
 import time
 import asyncio
 import logging
@@ -12,8 +11,6 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import asdict
-from datetime import datetime, timedelta
-from typing import Optional
 
 from redis.asyncio import Redis
 import subprocess
@@ -39,7 +36,7 @@ from app.settings import settings
 from rich.console import Console
 from rich.logging import RichHandler
 from .utils.metrics import MetricsCollector
-from stage2.calibration_queue import CalibrationQueue, AssetClassConfig
+from stage2.calibration_queue import CalibrationQueue
 from app.screening_producer import AssetStateManager
 from stage2.config import STAGE2_CONFIG
 from stage2.calibration.calibration_config import CalibrationConfig
@@ -49,7 +46,7 @@ load_dotenv()
 
 # --- Логування ---
 main_logger = logging.getLogger("main")
-main_logger.setLevel(logging.DEBUG)
+main_logger.setLevel(logging.INFO)
 main_logger.handlers.clear()
 main_logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 main_logger.propagate = False  # ← Критично важливо!
@@ -336,7 +333,7 @@ async def trade_manager_updater(
     monitor: AssetMonitorStage1,
     timeframe: str = "1m",
     lookback: int = 20,
-    interval_sec: int = 10,
+    interval_sec: int = 30,
 ):
     """
     Фоновий таск: оновлює активні угоди,
@@ -389,11 +386,11 @@ async def run_pipeline() -> None:
     """
 
     # 1. Ініціалізація
-    cache = await init_system()
-    file_manager = FileManager()
-    buffer = RAMBuffer(max_bars=120)
-    calibration_config = CalibrationConfig()
-    stage2_config = STAGE2_CONFIG
+    cache = await init_system()  # Ініціалізуємо кеш
+    file_manager = FileManager()  # Файловий менеджер для зберігання даних
+    buffer = RAMBuffer(max_bars=120)  # RAMBuffer для зберігання історії
+    calibration_config = CalibrationConfig()  # Конфігурація калібрування
+    stage2_config = STAGE2_CONFIG  # Конфігурація Stage2
 
     # Підключення до Redis
     redis_conn = Redis(
@@ -403,15 +400,15 @@ async def run_pipeline() -> None:
         encoding="utf-8",
     )
 
-    launch_ui_consumer()
-    trade_manager = TradeLifecycleManager(log_file="trade_log.jsonl")
-    file_manager = FileManager()
-    buffer = RAMBuffer(max_bars=500)
+    launch_ui_consumer()  # Запускаємо UI-споживача у новому терміналі
+    trade_manager = TradeLifecycleManager(log_file="trade_log.jsonl")  # Менеджер угод
+    file_manager = FileManager()  # Файловий менеджер
+    buffer = RAMBuffer(max_bars=500)  # RAMBuffer для зберігання історії
     thresholds = {
-        "MIN_QUOTE_VOLUME": 1_000_000.0,
-        "MIN_PRICE_CHANGE": 3.0,
-        "MIN_OPEN_INTEREST": 500_000.0,
-        "MAX_SYMBOLS": 350,
+        "MIN_QUOTE_VOLUME": 1_000_000.0,  # Мінімальний об'єм торгівлі
+        "MIN_PRICE_CHANGE": 3.0,  # Мінімальна зміна ціни
+        "MIN_OPEN_INTEREST": 500_000.0,  # Мінімальний відкритий інтерес
+        "MAX_SYMBOLS": 350,  # Максимальна кількість символів
     }
 
     # 2. Створюємо довгоживу ClientSession
@@ -420,27 +417,26 @@ async def run_pipeline() -> None:
         fetcher = OptimizedDataFetcher(cache_handler=cache, session=session)
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
-        use_manual_list = True  # Змінити на False для автоматичного режиму
+        use_manual_list = (
+            False  # Змінити на False для автоматичного режиму, True - для ручного
+        )
 
         if use_manual_list:
             # Ручний режим: використовуємо фіксований список
             fast_symbols = [
                 "btcusdt",
-                "moodengusdt",
-                "tonusdt",
                 "ethusdt",
-                "bnbusdt",
+                "tonusdt",
                 "adausdt",
-                "solusdt",
-                "xrpusdt",
             ]
-            await cache.set_fast_symbols(fast_symbols, ttl=3600)
+            await cache.set_fast_symbols(fast_symbols, ttl=3600)  # TTL 1 година
             main_logger.info(
                 f"[Main] Використовуємо ручний список символів: {fast_symbols}"
             )
         else:
             # Автоматичний режим: виконуємо первинний префільтр
             main_logger.info("[Main] Запускаємо первинний префільтр...")
+
             # Використовуємо новий механізм відбору активів
             fast_symbols = await get_filtered_assets(
                 session=session,
@@ -451,10 +447,12 @@ async def run_pipeline() -> None:
                 min_depth=50_000.0,
                 min_atr=0.5,
                 max_symbols=350,
-                dynamic=False,
+                dynamic=False,  # Фіксований список для первинного префільтру
             )
+
             fast_symbols = [s.lower() for s in fast_symbols]
-            await cache.set_fast_symbols(fast_symbols, ttl=600)
+            await cache.set_fast_symbols(fast_symbols, ttl=600)  # TTL 10 хвилин
+            # Логуємо кількість символів
             main_logger.info(
                 f"[Main] Первинний префільтр: {len(fast_symbols)} символів"
             )
@@ -468,7 +466,6 @@ async def run_pipeline() -> None:
         main_logger.info(
             f"[Main] Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
         )
-        # ===== КІНЕЦЬ НОВОЇ ЛОГІКИ =====
 
         # Preload історії
         await preload_1m_history(
@@ -491,6 +488,7 @@ async def run_pipeline() -> None:
 
         # --- CalibrationQueue ---
         main_logger.info("[Main] Ініціалізуємо CalibrationQueue...")
+
         # Ініціалізуємо AssetStateManager для коректної інтеграції зі станом активів
         assets_current = [s.lower() for s in fast_symbols]
         state_manager = AssetStateManager(assets_current)
@@ -515,6 +513,7 @@ async def run_pipeline() -> None:
             rsi_oversold=30,
             min_reasons_for_alert=2,
         )
+        # Встановлюємо глобальні рівні підтримки/опору
         monitor.set_global_levels(daily_data)
 
         # --- Виконуємо фон-воркери ---

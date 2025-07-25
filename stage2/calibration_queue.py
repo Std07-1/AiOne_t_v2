@@ -35,7 +35,7 @@ from rich.logging import RichHandler
 
 # ─────────────────── Налаштування логування ────────────────────
 log = logging.getLogger("calib_queue")
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 log.handlers.clear()
 log.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 log.propagate = False  # ← Критично важливо!

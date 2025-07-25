@@ -25,7 +25,7 @@ from stage2.calibration.calibration_config import CalibrationConfig
 
 # Налаштування логування
 logger = logging.getLogger("calibration_module")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)

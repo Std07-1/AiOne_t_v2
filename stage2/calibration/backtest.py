@@ -9,7 +9,7 @@ from rich.logging import RichHandler
 
 # --- Логування ---
 logger = logging.getLogger("backtest")
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 logger.handlers.clear()
 logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False

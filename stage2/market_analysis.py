@@ -706,11 +706,11 @@ class Stage2Processor:
             narrative = self._generate_trader_narrative(
                 market_context, anomalies, calibrated_signal["trigger_reasons"]
             )
-            logger.debug(f"Згенерований нарратив: {narrative}")
+            logger.info(f"Згенерований нарратив: {narrative}")
 
             # Формування рекомендації
             recommendation = self._generate_recommendation(market_context, confidence)
-            logger.debug(f"Рекомендація: {recommendation}")
+            logger.info(f"Рекомендація: {recommendation}")
 
             # Розрахунок ризикових параметрів
             risk_params = self._calculate_risk_parameters(

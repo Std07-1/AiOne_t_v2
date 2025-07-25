@@ -98,3 +98,21 @@ def format_open_interest(oi: float) -> str:
         result = f"{val:.2f} USD"
     logger.debug(f"[format_open_interest] Вихід: {result}")
     return result
+
+
+def format_price(price: float, symbol: str) -> str:
+    """Форматує ціну відповідно до специфіки активу"""
+    # Визначаємо кількість знаків після коми на основі символу
+    decimals = 4  # Значення за замовчуванням
+
+    if "btc" in symbol or "eth" in symbol:
+        decimals = 2
+    elif "usdt" in symbol:
+        decimals = 4
+
+    # Форматуємо з відповідною точністю
+    if price < 1:
+        return f"{price:.{decimals}f}"
+    else:
+        # Для великих чисел використовуємо роздільник тисяч
+        return f"{price:,.{decimals}f}"
