@@ -1,4 +1,4 @@
-# monitor/asset_monitor/ui_consumer.py
+# UI/ui_consumer.py
 
 import redis.asyncio as redis
 import json

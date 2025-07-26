@@ -18,7 +18,6 @@ from utils.utils_1_2 import _safe_float
 from stage2.calibration_queue import CalibrationQueue
 from stage2.market_analysis import stage2_consumer
 from utils.utils_1_2 import ensure_timestamp_column
-from stage1.utils import format_volume_usd, format_open_interest
 
 
 # --- Налаштування логування ---
