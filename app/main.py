@@ -418,7 +418,7 @@ async def run_pipeline() -> None:
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
         use_manual_list = (
-            True  # Змінити на False для автоматичного режиму, True - для ручного
+            False  # Змінити на False для автоматичного режиму, True - для ручного
         )
 
         if use_manual_list:

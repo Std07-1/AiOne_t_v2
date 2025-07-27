@@ -1,59 +1,133 @@
 # UI/ui_consumer.py
-
 import redis.asyncio as redis
 import json
 import logging
 import asyncio
-from typing import Any, Dict, List
+import time
+import math
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.logging import RichHandler
-
 from rich.live import Live
-from rich.table import Table
-from rich import box
+from rich.table import Table, Column
+from rich.panel import Panel
+from rich.text import Text
+from rich.style import Style
+from rich.progress import Progress, BarColumn, TextColumn
+from rich.box import ROUNDED
 
-from stage1.utils import format_volume_usd, format_open_interest, format_price
-
-# Окрема консоль для Live-таблиці (stdout)
+# Окрема консоль для Live-таблиці
 ui_console = Console(stderr=False)
 
-# Окремий логер для ui_consumer
+# Логування
 ui_logger = logging.getLogger("ui_consumer")
-ui_logger.setLevel(logging.INFO)  # логуються тільки INFO і вище
-ui_logger.addHandler(RichHandler(console=Console(stderr=True), level="WARNING"))
-ui_logger.propagate = False  # щоб не дублювати логи у root-logger
+ui_logger.setLevel(logging.INFO)
+ui_logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+ui_logger.propagate = False
+
+
+class AlertAnimator:
+    def __init__(self):
+        self.active_alerts = {}
+
+    def add_alert(self, symbol: str):
+        self.active_alerts[symbol] = time.time()
+
+    def should_highlight(self, symbol: str) -> bool:
+        if symbol in self.active_alerts:
+            elapsed = time.time() - self.active_alerts[symbol]
+            if elapsed < 8.0:
+                return True
+            else:
+                del self.active_alerts[symbol]
+        return False
 
 
 class UI_Consumer:
     def __init__(
         self,
-        vol_z_threshold: float = 2.0,
-        # нижній поріг ATR у відсотках (ATR/price)
-        low_atr_threshold: float = 0.005,  # 0.5% ціни
+        vol_z_threshold: float = 2.5,  # Поріг Z-статистики для обсягу
+        low_atr_threshold: float = 0.005,  # Поріг ATR% для низької волатильності
     ):
-        """
-        :param vol_z_threshold: Z-поріг для позначення аномального обсягу (volume_z)
-        :param low_atr_threshold: мінімальний відносний ATR для активації сигналу (у частках ціни)
-        """
-        self.vol_z_threshold = vol_z_threshold
-        self.low_atr_threshold = low_atr_threshold
+        self.vol_z_threshold = vol_z_threshold  # Поріг Z-статистики для обсягу
+        self.low_atr_threshold = (
+            low_atr_threshold  # Поріг ATR% для низької волатильності
+        )
+        self.alert_animator = AlertAnimator()  # Аніматор для алертів
+        self.last_update_time = time.time()  # Час останнього оновлення
+
+    def _format_price(self, price: float) -> str:
+        """Форматування ціни з роздільником тисяч"""
+        if price >= 1000:
+            return f"{price:,.2f}"
+        return f"{price:.4f}"
+
+    def _get_rsi_color(self, rsi: float) -> str:
+        """Колір для RSI на основі значення"""
+        if rsi < 30:
+            return "green"
+        elif rsi < 50:
+            return "light_green"
+        elif rsi < 70:
+            return "yellow"
+        else:
+            return "red"
+
+    def _get_atr_color(self, atr_pct: float) -> str:
+        """Колір для ATR% на основі волатильності"""
+        if atr_pct < self.low_atr_threshold:
+            return "red"
+        elif atr_pct > 0.02:
+            return "yellow"
+        return ""
+
+    def _get_calib_status_icon(self, status: str) -> str:
+        """Іконки для статусу калібрування"""
+        icons = {
+            "completed": "✅",
+            "in_progress": "🔄",
+            "queued_urgent": "⚠️🔴",
+            "queued_high": "⚠️🟡",
+            "queued": "⚠️",
+            "pending": "⏳",
+            "error": "❌",
+            "timeout": "⏱️",
+        }
+        return icons.get(status, "❓")
+
+    def _get_signal_icon(self, signal: str) -> str:
+        """Іконки для типу сигналу"""
+        icons = {
+            "ALERT": "🔴",
+            "NORMAL": "🟢",
+            "ALERT_BUY": "🟢↑",
+            "ALERT_SELL": "🔴↓",
+            "NONE": "⚪",
+        }
+        return icons.get(signal, "❓")
+
+    def _get_recommendation_icon(self, recommendation: str) -> str:
+        """Іконки для рекомендацій Stage2"""
+        icons = {
+            "STRONG_BUY": "🟢↑↑",
+            "BUY_IN_DIPS": "🟢↑",
+            "HOLD": "🟡",
+            "SELL_ON_RALLIES": "🔴↓",
+            "STRONG_SELL": "🔴↓↓",
+            "AVOID": "⚫",
+        }
+        return icons.get(recommendation, "")
 
     async def redis_consumer(
         self,
         redis_url: str = "redis://localhost:6379/0",
         channel: str = "asset_state_update",
-        refresh_rate: float = 0.5,
-        loading_delay: float = 5.0,
-        smooth_delay: float = 0.4,
+        refresh_rate: float = 0.7,  # Частота оновлення в секундах
+        loading_delay: float = 2.0,  # Затримка перед початком рендера
+        smooth_delay: float = 0.5,  # Затримка між оновленнями в циклі
     ):
-        """
-        Live-рендер сигналів з Redis Pub/Sub:
-            - Підключається до Redis
-            - Слухає оновлення стану активів
-            - Відображає дані у таблиці
-        """
-
         last_results: List[Dict[str, Any]] = []
         redis_client = redis.from_url(redis_url)
         pubsub = redis_client.pubsub()
@@ -85,14 +159,18 @@ class UI_Consumer:
                                 f"Отримано оновлення для {len(data)} активів"
                             )
 
-                    loading = not bool(last_results)
-                    table = self._build_signal_table(last_results, loading=loading)
-                    live.update(table)
+                    # Оновлюємо аніматори для алертів
+                    for r in last_results:
+                        if r.get("signal") == "ALERT":
+                            self.alert_animator.add_alert(r["symbol"])
 
+                    table = self._build_signal_table(last_results)
+                    live.update(table)
                     await asyncio.sleep(smooth_delay)
+
                 except (ConnectionError, TimeoutError) as e:
-                    ui_logger.error(f"Помилка з'єднання з Redis: {str(e)}")
-                    await asyncio.sleep(3)  # Перепідключення через 3 сек
+                    ui_logger.error(f"Помилка з'єднання: {str(e)}")
+                    await asyncio.sleep(3)
                     try:
                         await pubsub.reset()
                         await pubsub.subscribe(channel)
@@ -110,62 +188,75 @@ class UI_Consumer:
         results: List[dict],
         loading: bool = False,
     ) -> Table:
-        """
-        Будує та повертає Rich.Table зі списку сигналів разом із статистикою
-        в заголовку. Без зовнішніх console.print — вся візуалізація в межах самої таблиці.
-        """
-        # ─── Підрахунок статистики одразу ────────────────────────────────────
-        anomaly_count = 0
-        warning_count = 0
-        total = len(results)
+        """Побудова таблиці з сигналами та метриками системи"""
 
-        # ─── Ініціалізуємо таблицю ───────────────────────────────────────────
-        # Заголовок доповнюємо місцем для статистики, поки що без чисел
-        title = "Сигнали по активам"
-        table = Table(title=title, box=box.SIMPLE_HEAVY)
+        # Статистика системи
+        total_assets = len(results)
+        alert_count = sum(1 for r in results if r.get("signal", "").startswith("ALERT"))
+        calib_stats = {
+            "completed": 0,
+            "in_progress": 0,
+            "queued": 0,
+            "error": 0,
+            "pending": 0,
+        }
 
-        # ─── Додаємо колонки ────────────────────────────────────────────────
-        headers = [
-            ("Символ", "cyan", "left"),
-            ("Ціна", None, "right"),
-            ("Обсяг", None, "right"),
-            ("OI", None, "right"),
-            ("RSI", None, "right"),
-            ("ATR%", None, "right"),
-            ("RS", None, "right"),
-            ("Corr", None, "right"),
-            ("Аном.", None, "center"),
-            ("❗", None, "center"),
-            ("Статус", None, "center"),
-            ("Причини", None, "left"),
-            ("S2", None, "center"),  # Stage2: long/short
-            ("Сценарій", None, "left"),
-            ("TP", None, "right"),
-            ("SL", None, "right"),
+        for r in results:
+            status = r.get("calib_status", "")
+            if status in calib_stats:
+                calib_stats[status] += 1
+
+        last_update = datetime.fromtimestamp(self.last_update_time).strftime("%H:%M:%S")
+
+        # Заголовок таблиці з статистикою
+        title = (
+            f"[bold]Система моніторингу AiOne_t[/bold] | "
+            f"Активи: [green]{total_assets}[/green] | "
+            f"ALERT: [red]{alert_count}[/red] | "
+            f"Калібровано: [green]{calib_stats['completed']}[/green] | "
+            f"В черзі: [yellow]{calib_stats['queued']+calib_stats['in_progress']}[/yellow] | "
+            f"Оновлено: [cyan]{last_update}[/cyan]"
+        )
+
+        table = Table(
+            title=title,
+            box=ROUNDED,
+            show_header=True,
+            header_style="bold magenta",
+            expand=True,
+        )
+
+        # Колонки таблиці
+        columns = [
+            ("Символ", "left"),
+            ("Ціна", "right"),
+            ("Обсяг", "right"),
+            ("ATR%", "right"),
+            ("RSI", "right"),
+            ("Статус", "center"),
+            ("Причини", "left"),
+            ("Сигнал", "center"),
+            ("Калібр.", "center"),
+            ("Stage2", "center"),
+            ("Рекомендація", "left"),
+            ("TP/SL", "right"),
         ]
-        for h, style, justify in headers:
-            table.add_column(h, style=style or "", justify=justify or "left")
 
-        # ─── Spinner поки завантажується ────────────────────────────────────
-        if loading:
-            table.add_row("[cyan]🔄 Аналізую…[/]", *[""] * (len(table.columns) - 1))
+        for header, justify in columns:
+            table.add_column(header, justify=justify)
+
+        # Сповіщення про завантаження
+        if loading or not results:
+            table.add_row("[cyan]🔄 Очікування даних...[/]", *[""] * (len(columns) - 1))
             return table
 
-        # ─── Якщо немає результатів ────────────────────────────────────────
-        if total == 0:
-            table.add_row(*["—"] * (len(table.columns) - 1), "[green]Немає сигналів[/]")
-            # Оновимо заголовок із статистикою (0/0)
-            table.title = f"{title}  |  Аномалії: 0/0  Warnings: 0/0"
-            return table
-
-        # ─── Пріоритетне сортування ─────────────────────────────────────────
         def priority_key(r: dict) -> tuple:
-            stats = r["stats"]
-            reasons = set(r["trigger_reasons"])
-            is_alert = r["signal"] == "ALERT"
+            stats = r.get("stats", {})
+            reasons = set(r.get("trigger_reasons", []))
+            is_alert = r.get("signal", "").startswith("ALERT")
             anomaly = stats.get("volume_z", 0.0) >= self.vol_z_threshold
             warning = (not is_alert) and bool(reasons)
-            # Категорії 0–4…
+
             if is_alert and "volume_spike" in reasons:
                 cat = 0
             elif is_alert:
@@ -180,100 +271,121 @@ class UI_Consumer:
 
         sorted_results = sorted(results, key=priority_key)
 
-        # ─── Додаємо рядки та рахуємо статистику ────────────────────────────
-        for r in sorted_results:
-            s = r["stats"]
-            is_alert = r["signal"] == "ALERT"
-            anomaly = s.get("volume_z", 0.0) >= self.vol_z_threshold
-            warning_flag = "❗" if (not is_alert and r["trigger_reasons"]) else ""
-            anomaly_cell = "✅" if anomaly else ""
+        # Додавання рядків для кожного активу
+        for asset in sorted_results:
+            symbol = asset["symbol"].upper()
+            stats = asset.get("stats", {})
+            stage2 = asset.get("stage2_result", {})
 
-            # 1) числові значення
-            price_val = s.get("current_price", 0.0)
-            atr_val = s.get("atr", 0.0)
+            # Ціна
+            current_price = stats.get("current_price", 0)
 
-            # 2) форматовані рядки
-            price = format_price(s.get("current_price", 0.0), r["symbol"])
-            # ATR% від ціни
-            atr_pct = (atr_val / price_val) if price_val else 0.0
-            atr_pct_str = f"{atr_pct*100:.2f}%"
-            if atr_pct < self.low_atr_threshold:
-                atr_pct_str = f"[bold red]{atr_pct_str}[/]"
+            stage2_status = asset.get("stage2_result", {}).get("status", "")
+            base_style = "dim"
 
-            vol = format_volume_usd(s.get("volume_mean", 0.0))
-            oi = "-"
-            if isinstance(s.get("open_interest"), (int, float)):
-                oi = format_open_interest(s["open_interest"])
+            if stage2_status == "completed":
+                base_style = "green"
+            elif stage2_status == "pending":
+                base_style = "yellow"
 
-            rsi_str = (
-                f"{s.get('rsi'):.1f}" if isinstance(s.get("rsi"), (int, float)) else "-"
+            # Підсвітка для alert, інакше — базовий стиль
+            row_style = (
+                "bold red"
+                if self.alert_animator.should_highlight(symbol)
+                else base_style
             )
-            rs_str = (
-                f"{s.get('rel_strength'):.4f}"
-                if isinstance(s.get("rel_strength"), (int, float))
+
+            price_str = self._format_price(current_price)
+
+            # Обсяг
+            volume = stats.get("volume_mean", 0)
+            volume_z = stats.get("volume_z", 0)
+            volume_str = f"{volume:,.0f}"
+            if volume_z > self.vol_z_threshold:
+                volume_str = f"[bold magenta]{volume_str}[/]"
+
+            # ATR%
+            atr = stats.get("atr", 0)
+            atr_pct = (atr / current_price * 100) if current_price else 0
+            atr_color = self._get_atr_color(atr_pct)
+            atr_str = f"[{atr_color}]{atr_pct:.2f}%[/]"
+
+            # RSI
+            rsi = stats.get("rsi", 0)
+            rsi_color = self._get_rsi_color(rsi)
+            rsi_str = f"[{rsi_color}]{rsi:.1f}[/]"
+
+            # Статус
+            status = asset.get("state", "normal")
+            status_icon = "🟢" if status == "normal" else "🔴"
+            status_str = f"{status_icon} {status}"
+
+            # Сигнал
+            signal = asset.get("signal", "NONE")
+            signal_icon = self._get_signal_icon(signal)
+            signal_str = f"{signal_icon} {signal}"
+
+            # Калібрування
+            calib_status = asset.get("calib_status", "pending")
+            calib_icon = self._get_calib_status_icon(calib_status)
+            calib_str = f"{calib_icon} {calib_status}"
+
+            # Stage2
+            stage2_status = asset.get("stage2_status", "pending")
+            stage2_icon = "🟩" if stage2_status == "completed" else "🟨"
+            stage2_str = f"{stage2_icon} {stage2_status}"
+
+            # Рекомендація
+            recommendation = stage2.get("recommendation", "-")
+            rec_icon = self._get_recommendation_icon(recommendation)
+            rec_str = f"{rec_icon} {recommendation}"
+
+            # TP/SL
+            tp = asset.get("tp", 0)
+            sl = asset.get("sl", 0)
+            tp_sl_str = (
+                f"TP: {self._format_price(tp)}\nSL: {self._format_price(sl)}"
+                if tp and sl
                 else "-"
             )
-            corr_str = (
-                f"{s.get('btc_dependency_score'):.2f}"
-                if isinstance(s.get("btc_dependency_score"), (int, float))
-                else "-"
-            )
 
-            sig_text = "🔴 ALERT" if is_alert else "🟢 NORMAL"
-            sig_style = "bold red" if is_alert else "bold green"
+            # Підсвітка рядка для нових алертів
+            row_style = (
+                "bold red" if self.alert_animator.should_highlight(symbol) else ""
+            )
 
             tags = []
-            for reason in r["trigger_reasons"]:
+            for reason in asset.get("trigger_reasons", []):
                 if reason == "volume_spike":
                     tags.append("[magenta]Сплеск обсягу[/]")
                 else:
                     tags.append(f"[yellow]{reason}[/]")
             reasons = "  ".join(tags) or "-"
 
-            # Збільшуємо лічильники
-            anomaly_count += int(anomaly)
-            warning_count += int(bool(warning_flag))
-
-            # отримуємо Stage2-сигнал і сценарій
-            stage2 = r.get("stage2", "-")
-            if stage2 == "long":
-                stage2 = "[green]LONG[/]"
-            elif stage2 == "short":
-                stage2 = "[red]SHORT[/]"
-            else:
-                stage2 = "-"
-
-            scenario = r.get("scenario", "-")
-            scenario = f"[magenta]{scenario}[/]"
-
-            # Форматуємо TP/SL, якщо є — інакше ставимо "-"
-            tp = f"{r.get('tp'):.4f}" if r.get("tp") is not None else "-"
-            sl = f"{r.get('sl'):.4f}" if r.get("sl") is not None else "-"
-
             table.add_row(
-                r["symbol"],  # Символ
-                price,  # Ціна
-                vol,  # Обсяг
-                oi,  # OI
-                rsi_str,  # RSI
-                atr_pct_str,  # ATR%
-                rs_str,  # RS
-                corr_str,  # Corr
-                anomaly_cell,  # Аном.
-                warning_flag,  # ❗
-                f"[{sig_style}]{sig_text}[/]",  # Статус
+                symbol,
+                price_str,
+                volume_str,
+                atr_str,
+                rsi_str,
+                status_str,
                 reasons,  # Причини
-                stage2,  # S2
-                scenario,  # Сценарій
-                tp,  # TP
-                sl,  # SL
+                signal_str,
+                calib_str,
+                stage2_str,
+                rec_str,
+                tp_sl_str,
+                style=row_style,
             )
 
-        # ─── Оновлюємо заголовок із підрахованою статистикою ───────────────
-        table.title = (
-            f"{title}"
-            f"  |  Аномалії: {anomaly_count}/{total}"
-            f"  Warnings: {warning_count}/{total}"
-        )
-
         return table
+
+
+# Головна функція запуску
+async def main():
+    consumer = UI_Consumer()
+    await consumer.redis_consumer()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
