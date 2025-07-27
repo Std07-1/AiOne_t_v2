@@ -567,7 +567,7 @@ async def screening_producer(
             ]
             await asyncio.gather(*urgent_tasks)
             for symbol in urgent_calib_tasks:
-                logger.info(f"[CALIB_QUEUE] Додано у чергу: {symbol} (ALERT)")
+                logger.debug(f"[CALIB_QUEUE] Додано у чергу: {symbol} (ALERT)")
                 state_manager.update_asset(
                     symbol,
                     {
@@ -596,7 +596,7 @@ async def screening_producer(
 
             # Обробка звичайних завдань (асинхронно, з логуванням)
             for symbol in normal_tasks:
-                logger.info(f"[CALIB_QUEUE] Додаємо звичайне калібрування: {symbol}")
+                logger.debug(f"[CALIB_QUEUE] Додаємо звичайне калібрування: {symbol}")
             normal_tasks_async = [
                 asyncio.create_task(
                     calib_queue.put(symbol=symbol, tf=timeframe, priority=0.5)
@@ -605,7 +605,7 @@ async def screening_producer(
             ]
             await asyncio.gather(*normal_tasks_async)
             for symbol in normal_tasks:
-                logger.info(f"[CALIB_QUEUE] Додано у чергу: {symbol} (NORMAL)")
+                logger.debug(f"[CALIB_QUEUE] Додано у чергу: {symbol} (NORMAL)")
                 state_manager.update_asset(symbol, {"calib_status": "queued"})
 
         # Генерація Stage1 сигналів (паралельна обробка)

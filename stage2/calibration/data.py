@@ -38,7 +38,7 @@ async def load_data(fetcher, buffer, symbol, timeframe, date_from, date_to, min_
         logger.debug(f"[load_data] Спроба отримати з RAMBuffer: {symbol}/{timeframe}")
         bars = buffer.get(symbol, timeframe, count=min_bars)
         if bars is not None and len(bars) > 0:
-            logger.info(
+            logger.debug(
                 f"[load_data] Отримано {len(bars)} барів з RAMBuffer для {symbol}/{timeframe}"
             )
             df = pd.DataFrame(bars)
@@ -49,7 +49,7 @@ async def load_data(fetcher, buffer, symbol, timeframe, date_from, date_to, min_
     # 2. Якщо недостатньо — підкачуємо через fetcher
     if df is None or len(df) < min_bars:
         missing_bars = min_bars - len(df) if df is not None else min_bars
-        logger.info(
+        logger.debug(
             f"[load_data] Потрібно дозавантажити {missing_bars} барів через fetcher для {symbol}/{timeframe}"
         )
         start_ms = int(date_from.timestamp() * 1000) if date_from else None
@@ -66,7 +66,7 @@ async def load_data(fetcher, buffer, symbol, timeframe, date_from, date_to, min_
             logger.error(f"[{symbol}] Помилка отримання даних через fetcher: {e}")
             return None
         if fetched is not None and isinstance(fetched, pd.DataFrame):
-            logger.info(
+            logger.debug(
                 f"[load_data] Отримано {len(fetched)} барів через fetcher для {symbol}/{timeframe}"
             )
             fetched = fetched.reset_index(drop=True)
@@ -95,7 +95,7 @@ async def load_data(fetcher, buffer, symbol, timeframe, date_from, date_to, min_
     except Exception as e:
         logger.error(f"[{symbol}] Валідація даних не пройдена: {e}")
         return None
-    logger.info(f"[load_data] Дані для {symbol}/{timeframe} готові, shape={df.shape}")
+    logger.debug(f"[load_data] Дані для {symbol}/{timeframe} готові, shape={df.shape}")
     return df
 
 

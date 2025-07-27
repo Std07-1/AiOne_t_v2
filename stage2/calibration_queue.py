@@ -23,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, NamedTuple
 import json
+from rich.pretty import pretty_repr
 
 # Внутрішні пакети
 from data.cache_handler import SimpleCacheHandler
@@ -214,12 +215,12 @@ class CalibrationQueue:
                     )
                 # Додаємо нове завдання з оновленим пріоритетом
                 await self._queue.put(self._calculate_priority(new_task))
-                log.info(f"[put] Додано оновлене термінове завдання для {symbol}/{tf}")
+                log.debug(f"[put] Додано оновлене термінове завдання для {symbol}/{tf}")
                 return
             log.debug(f"[put] Завдання вже в черзі, дубль не додається")
             return  # Завдання вже в черзі, не додаємо дубль
 
-        log.info(
+        log.debug(
             f"[QUEUE_PUT] Додаємо завдання: symbol={symbol}, tf={tf}, priority={priority}, is_urgent={is_urgent}, is_high_priority={is_high_priority}"
         )
 
@@ -243,7 +244,7 @@ class CalibrationQueue:
             "active_workers", self._sem._value
         )  # pylint: disable=protected-access
         self._metrics.gauge("circuit_breaker_active", len(self._circuit_breaker))
-        log.info(
+        log.debug(
             f"[QUEUE_PUT] Завдання додано у чергу: symbol={symbol}, tf={tf}, priority={priority}, is_urgent={is_urgent}, is_high_priority={is_high_priority}, queue_size={self._queue.qsize()}"
         )
         if is_high_priority:
@@ -264,7 +265,7 @@ class CalibrationQueue:
 
     async def start_workers(self, n_workers: int = 2) -> None:
         """Запускає воркери з обробкою помилок."""
-        log.info(f"[start_workers] self._engine: {self._engine}")
+        log.debug(f"[start_workers] self._engine: {self._engine}")
         log.info(
             f"[start_workers] self._sem._value: {self._sem._value}, len(self._workers): {len(self._workers)}"
         )
@@ -287,7 +288,7 @@ class CalibrationQueue:
             self._workers.append(worker)
             self._metrics.inc("active_workers")
             log.debug("Воркер створено, очікування на запуск...")
-        log.info("Старт воркерів: %d", workers_to_start)
+        log.debug("Старт воркерів: %d", workers_to_start)
 
     async def shutdown(self, timeout: float = 10.0) -> None:
         """Коректне завершення з очікуванням завершення завдань."""
@@ -399,7 +400,7 @@ class CalibrationQueue:
 
     async def _safe_worker(self) -> None:
         """Воркер з обробкою помилок та повторними спробами."""
-        log.info("[safe_worker] Воркер стартує...")
+        log.debug("[safe_worker] Воркер стартує...")
         while True:
             # Додаємо короткий sleep для звільнення потоку
             await asyncio.sleep(0.01)
@@ -410,16 +411,16 @@ class CalibrationQueue:
     async def _worker_loop(self) -> None:
         """Основний цикл обробки завдань з діагностикою очікування."""
         worker_id = id(asyncio.current_task())
-        log.info(f"[worker_loop] Стартує цикл обробки завдань (worker_id={worker_id})")
+        log.debug(f"[worker_loop] Стартує цикл обробки завдань (worker_id={worker_id})")
         last_get_time = time.time()
         while True:
             await asyncio.sleep(0)
             queue_size = self._queue.qsize()
-            log.info(
+            log.debug(
                 f"[worker_loop] Поточний розмір черги: {queue_size} (worker_id={worker_id})"
             )
             if queue_size > 0:
-                log.info(
+                log.debug(
                     f"[worker_loop] Черга містить {queue_size} завдань (worker_id={worker_id})"
                 )
 
@@ -435,7 +436,7 @@ class CalibrationQueue:
                 log.debug(
                     f"[worker_loop] Воркер {worker_id} отримав завдання через {wait_time:.2f} сек"
                 )
-            log.info(
+            log.debug(
                 f"[worker_loop] Отримано завдання з черги: {prio_task} (worker_id={worker_id})"
             )
             _, task = prio_task
@@ -448,12 +449,12 @@ class CalibrationQueue:
                 )
                 continue
             if task is None:
-                log.info(
+                log.debug(
                     f"[worker_loop] Отримано сигнал для завершення воркера (worker_id={worker_id})"
                 )
                 break
             symbol, tf = task.symbol, task.tf
-            log.info(
+            log.debug(
                 f"[worker_loop] Обробка завдання: {symbol}/{tf} (prio={task.priority}) is_urgent={task.is_urgent} is_high_priority={task.is_high_priority} (worker_id={worker_id})"
             )
 
@@ -465,7 +466,7 @@ class CalibrationQueue:
 
             queue_time = time.time() - task.created_at
             self._metrics.observe("queue_time", queue_time)
-            log.info(
+            log.debug(
                 f"[worker_loop] Завдання в черзі {queue_time:.2f} сек (worker_id={worker_id})"
             )
 
@@ -490,7 +491,7 @@ class CalibrationQueue:
             )
 
             async with self._sem:
-                log.info(
+                log.debug(
                     f"[worker_loop] Воркер {worker_id} починає калібрування {symbol}/{tf}"
                 )
                 await self._process_task(task)
@@ -500,7 +501,7 @@ class CalibrationQueue:
     async def _process_task(self, task: CalibrationTask) -> None:
         """Обробка одного завдання калібрування з діагностикою та детальним логуванням"""
         symbol, tf = task.symbol, task.tf
-        log.info(
+        log.debug(
             f"[CALIB_WORKER] ▶️ Старт калібрування {symbol}/{tf} (prio={task.priority}, urgent={task.is_urgent}, high={task.is_high_priority})"
         )
         processing_start = time.time()  # Діагностичні метрики
@@ -508,7 +509,7 @@ class CalibrationQueue:
         # Отримання динамічних параметрів з адаптивним TTL
         params = self._get_dynamic_params(symbol, task.is_high_priority)
         params["result_ttl"] = self._calculate_ttl(symbol)
-        log.info(f"[CALIB_WORKER] Параметри калібрування для {symbol}/{tf}: {params}")
+        log.debug(f"[CALIB_WORKER] Параметри калібрування для {symbol}/{tf}: {params}")
 
         if task.is_urgent:
             # Швидкий режим для ALERT
@@ -519,7 +520,7 @@ class CalibrationQueue:
             )
 
         # Виконання калібрування
-        log.info(f"[CALIB_WORKER] Виклик calibrate_symbol_timeframe для {symbol}/{tf}")
+        log.debug(f"[CALIB_WORKER] Виклик calibrate_symbol_timeframe для {symbol}/{tf}")
         try:
             result = await self._engine.calibrate_symbol_timeframe(
                 symbol=symbol,
@@ -530,7 +531,7 @@ class CalibrationQueue:
                 config_template=None,
                 override_old=False,
             )
-            log.info(
+            log.debug(
                 f"[CALIB_WORKER] ✅ Завершено calibrate_symbol_timeframe для {symbol}/{tf}"
             )
         except Exception as e:
@@ -545,7 +546,43 @@ class CalibrationQueue:
                 )
             raise
 
-        log.info(f"[CALIB_WORKER] Результат калібрування для {symbol}/{tf}: {result}")
+        oos = result.get("oos_validation", {})
+        oos_data = (
+            {
+                "sharpe": round(oos["sharpe"], 4),
+                "sortino": round(oos["sortino"], 4),
+                "profit_factor": round(oos["profit_factor"], 4),
+                "win_rate": oos["win_rate"],
+                "total_trades": oos["total_trades"],
+            }
+            if all(
+                k in oos
+                for k in (
+                    "sharpe",
+                    "sortino",
+                    "profit_factor",
+                    "win_rate",
+                    "total_trades",
+                )
+            )
+            else None
+        )
+
+        formatted = {
+            "symbol": symbol,
+            "timeframe": tf,
+            "event": "CalibrationResult",
+            "status": "❌ failed" if result.get("error") else "✅ success",
+            "error": result.get("error"),
+            "circuit_breaker": result.get("circuit_breaker"),
+            "oos_validation": oos_data,
+            "calibration_time": result.get("calibration_time"),
+        }
+
+        log.info(
+            f"[CALIB_WORKER] Результат калібрування для {symbol}/{tf}: {pretty_repr(formatted)}"
+        )
+
         # Перевірка результату калібрування
         if not isinstance(result, dict):
             log.error(
@@ -565,7 +602,7 @@ class CalibrationQueue:
             raise RuntimeError(f"Калібрування не вдалося для {symbol}/{tf}")
 
         # Оновлення кешу з адаптивним TTL
-        log.info(f"[CALIB_WORKER] Оновлення кешу для {symbol}/{tf}")
+        log.debug(f"[CALIB_WORKER] Оновлення кешу для {symbol}/{tf}")
         await self._cache.set_json(
             symbol,
             tf,
@@ -576,7 +613,7 @@ class CalibrationQueue:
 
         # Оновлення статусу та результатів
         if hasattr(self, "_state_manager") and self._state_manager:
-            log.info(f"Updating state for {symbol} to 'completed'")
+            log.debug(f"Updating state for {symbol} to 'completed'")
             self._state_manager.update_asset(
                 symbol,
                 {
@@ -590,7 +627,7 @@ class CalibrationQueue:
         calibration_time = time.time() - processing_start
         self._metrics.observe("calibration_time", calibration_time)
         self._metrics.gauge(f"calib_{symbol}_status", 1)
-        log.info(
+        log.debug(
             f"[CALIB_WORKER] ✅ Успішно: {symbol}/{tf} (час: {calibration_time:.2f} сек)"
         )
 

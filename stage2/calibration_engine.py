@@ -23,14 +23,16 @@ from .calibration.data import load_data
 
 from stage2.calibration.calibration_config import CalibrationConfig
 
+from rich.table import Table, box
+from rich.console import Console
+from rich.logging import RichHandler
+
 # Налаштування логування
 logger = logging.getLogger("calibration_module")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-logger.propagate = False
+logger.handlers.clear()
+logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+logger.propagate = False  # ← Критично важливо!
 
 from optuna.exceptions import ExperimentalWarning
 
@@ -204,7 +206,7 @@ class CalibrationEngine:
                 "calibration_time": datetime.utcnow().isoformat(),
             }
 
-        logger.info(f"🚀 Початок калібрування для {symbol} на {timeframe} таймфреймі")
+        logger.debug(f"🚀 Початок калібрування для {symbol} на {timeframe} таймфреймі")
         redis_key = f"calib:{symbol}:{timeframe}"
         if not override_old:
             cached_result = await self.get_calibration_result(redis_key)
@@ -389,14 +391,6 @@ class CalibrationEngine:
                     f"🔄 Оновлено найкращі параметри на основі додаткового запуску: {best_params}"
                 )
 
-        # Підсумкова інформація для кожного символу/таймфрейму
-        logger.info(f"\n🔍 Результати оптимізації для {symbol}/{timeframe}:")
-        logger.info(f"   - Найкращий score: {best_value:.4f}")
-        logger.info(f"   - Успішні trial: {len(completed_trials)}/{n_trials}")
-        logger.info(f"   - Найкращі параметри:")
-        for param, value in best_params.items():
-            logger.info(f"      {param}: {value:.4f}")
-
         # Валідація на OOS даних
         oos_metrics = await self.run_oos_validation(
             symbol, timeframe, date_to, best_params
@@ -431,8 +425,71 @@ class CalibrationEngine:
                 "calibration_time": datetime.utcnow().isoformat(),
             }
 
-        # Збереження результатів у Redis
+        # --- Таблиця результатів --- (незалежно від успішності)
+        console = Console()
+        table = Table(
+            title=f"📊 Результати оптимізації: [bold magenta]{symbol.upper()} / {timeframe}[/]",
+            show_header=False,
+            box=box.SIMPLE_HEAVY,
+        )
+
+        table.add_row("Найкращий score", f"[bold green]{best_value:.4f}]")
+        table.add_row(
+            "Статус", "[green]✅ PASSED[/]" if is_valid else "[red]❌ FAILED[/]"
+        )
+        table.add_row(
+            "Circuit Breaker", "[yellow]—[/]" if is_valid else "[bold red]🛑 ON[/]"
+        )
+        table.add_row("Успішні Trial", f"[cyan]{len(completed_trials)} / {n_trials}[/]")
+
+        if oos_metrics:
+            for key in ("sharpe", "sortino", "profit_factor", "win_rate"):
+                if key in oos_metrics:
+                    table.add_row(key.title(), f"{oos_metrics[key]:.4f}")
+            if "win_rate" in oos_metrics and "profit_factor" in oos_metrics:
+                q_score = (
+                    oos_metrics["win_rate"] * 0.4 + oos_metrics["profit_factor"] * 0.6
+                )
+                table.add_row("Quality Score", f"[bold magenta]{q_score:.4f}[/]")
+
+        console.log(table)
+
+        # --- Параметри ---
+        console.log("[bold]📌 Найкращі параметри:[/]")
+        for k, v in best_params.items():
+            console.log(f"• [cyan]{k}[/]: {v:.4f}")
+        console.log(f"🕒 Час калібрування: {datetime.utcnow().isoformat()}")
+
+        # --- Формування фінального результату ---
+        result = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "recommended_params": best_params,
+            "best_value": best_value,
+            "trials": n_trials,
+            "calibration_time": datetime.utcnow().isoformat(),
+            "data_points": len(df),
+            "successful_trials": len(completed_trials),
+            "pruned_trials": len(pruned_trials),
+            "pruned_reasons": reasons,
+            "oos_validation": oos_metrics,
+            "seed": seed,
+        }
+
+        # --- Збереження та вихід ---
         await self.save_calibration_result(redis_key, result)
+
+        if not is_valid:
+            logger.warning(f"OOS валідація НЕ пройдена для {symbol}: {reason}")
+            self._trigger_circuit_breaker(symbol)
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "error": f"OOS validation failed: {reason}",
+                "circuit_breaker": True,
+                "oos_validation": oos_metrics,
+                "calibration_time": datetime.utcnow().isoformat(),
+            }
 
         return result
 
@@ -460,7 +517,7 @@ class CalibrationEngine:
             cached_data = await self.redis.get(redis_key)
             if cached_data:
                 result = json.loads(cached_data)
-                logger.info(f"✅ Використано кешований результат для {redis_key}")
+                logger.debug(f"✅ Використано кешований результат для {redis_key}")
                 return result
         except Exception as e:
             logger.error(f"Помилка отримання з кешу {redis_key}: {str(e)}")
@@ -473,7 +530,7 @@ class CalibrationEngine:
         try:
             # Додаємо TTL (час життя) для кешу - 1 година
             await self.redis.set(redis_key, json.dumps(result), ex=3600)
-            logger.info(f"✅ Результати калібрування збережено в кеші для {redis_key}")
+            logger.debug(f"✅ Результати калібрування збережено в кеші для {redis_key}")
         except Exception as e:
             logger.error(f"Помилка збереження в кеш {redis_key}: {str(e)}")
 

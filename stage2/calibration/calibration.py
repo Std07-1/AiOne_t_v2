@@ -78,7 +78,7 @@ def calculate_sortino(trades: list, symbol: str) -> float:
     logger.debug(f"[calculate_sortino][{symbol}] trades={len(trades)}")
     # Мінімум 3 трейдів для коректної метрики
     if not trades or len(trades) < 3:
-        logger.info(
+        logger.debug(
             f"[calculate_sortino][{symbol}] Недостатньо трейдів для розрахунку Sortino"
         )
         return 0.0
@@ -86,13 +86,13 @@ def calculate_sortino(trades: list, symbol: str) -> float:
     mean_return = np.mean(returns)  # Середній прибуток
     downside_returns = returns[returns < 0]  # Від'ємні прибутки
     if len(downside_returns) == 0:
-        logger.info(
+        logger.debug(
             f"[calculate_sortino][{symbol}] Немає збиткових трейдів, Sortino=1.5"
         )
         return safe_metric_value(1.5, symbol=symbol)
     downside_risk = np.std(downside_returns)  # Волатильність збитків
     if downside_risk == 0:
-        logger.info(
+        logger.debug(
             f"[calculate_sortino][{symbol}] Волатильність збитків нульова, Sortino=1.5"
         )
         return safe_metric_value(1.5, symbol=symbol)
@@ -107,7 +107,7 @@ def calculate_profit_factor(trades: list, symbol: str) -> float:
     """
     logger.debug(f"[calculate_profit_factor][{symbol}] trades={len(trades)}")
     if not trades:
-        logger.info(
+        logger.debug(
             f"[calculate_profit_factor][{symbol}] Немає трейдів для розрахунку Profit Factor"
         )
         return 0.0
@@ -115,7 +115,7 @@ def calculate_profit_factor(trades: list, symbol: str) -> float:
     gains = profits[profits > 0].sum()
     losses = -profits[profits < 0].sum()
     if losses == 0:
-        logger.info(
+        logger.debug(
             f"[calculate_profit_factor][{symbol}] Немає збитків, Profit Factor=3.0"
         )
         return safe_metric_value(3.0, symbol=symbol)
@@ -135,7 +135,7 @@ def calculate_weighted_score(summary: dict, trades: list, symbol: str) -> float:
         f"[calculate_weighted_score][{symbol}] trades={len(trades)}, summary={summary}"
     )
     if not trades:
-        logger.info(
+        logger.debug(
             f"[calculate_weighted_score][{symbol}] Немає трейдів для розрахунку композитного показника"
         )
         return 0.0
@@ -157,7 +157,7 @@ def calculate_weighted_score(summary: dict, trades: list, symbol: str) -> float:
         + weights["sharpe"] * sharpe
         + weights["win_rate"] * win_rate
     )
-    logger.info(
+    logger.debug(
         f"[calculate_weighted_score][{symbol}] Композитний показник: {composite * trade_count_factor:.4f} (трейдів: {n_trades})"
     )
     return composite * trade_count_factor
@@ -178,7 +178,7 @@ def objective(
     Optuna objective: основна функція для оптимізації параметрів стратегії.
     Всі логування та коментарі — українською.
     """
-    logger.info(
+    logger.debug(
         f"[objective][{symbol}] Запуск objective Optuna для калібрування стратегії"
     )
     df["symbol"] = symbol
@@ -248,7 +248,7 @@ def objective(
             return 0.0
         # Використання композитного показника за замовчуванням
         score = calculate_weighted_score(summary, trades, symbol=symbol)
-        logger.info(f"[objective][{symbol}] Score для тріалу: {score:.4f}")
+        logger.debug(f"[objective][{symbol}] Score для тріалу: {score:.4f}")
         return max(score, 0.0)
     except Exception as e:
         logger.error(f"[objective][{symbol}] Помилка objective: {str(e)}")

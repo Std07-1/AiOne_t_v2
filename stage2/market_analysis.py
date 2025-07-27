@@ -56,7 +56,7 @@ TRIGGER_NAMES = {
 # Налаштування логування
 logger = logging.getLogger("stage2_analyzer")
 
-logger.setLevel(logging.DEBUG)  # Змінено на DEBUG для детального логування
+logger.setLevel(logging.INFO)  # Змінено на INFO для зменшення обсягу логів
 handler = RichHandler(console=Console(stderr=True), show_path=False)
 logger.handlers.clear()
 logger.addHandler(handler)
@@ -706,7 +706,9 @@ class Stage2Processor:
             narrative = self._generate_trader_narrative(
                 market_context, anomalies, calibrated_signal["trigger_reasons"]
             )
-            logger.info(f"Згенерований нарратив: {narrative}")
+
+            # Логування згенерованого нарративу
+            logger.info(f"Згенерований нарратив: " f"{narrative}")
 
             # Формування рекомендації
             recommendation = self._generate_recommendation(market_context, confidence)

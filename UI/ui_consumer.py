@@ -6,16 +6,12 @@ import asyncio
 import time
 import math
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.live import Live
-from rich.table import Table, Column
-from rich.panel import Panel
-from rich.text import Text
-from rich.style import Style
-from rich.progress import Progress, BarColumn, TextColumn
+from rich.table import Table
 from rich.box import ROUNDED
 
 # Окрема консоль для Live-таблиці
