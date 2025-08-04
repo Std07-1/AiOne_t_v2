@@ -31,8 +31,37 @@ def _generate_recommendation(
     Returns:
         str: Рекомендація (STRONG_BUY, WAIT, AVOID тощо).
     """
+    logger.debug("Початок генерації торгової рекомендації")
     composite = confidence["composite_confidence"]
     scenario = context["scenario"]
+
+    # --- Додаємо розрахунок відстані ---
+    support = context["key_levels"]["immediate_support"]
+    resistance = context["key_levels"]["immediate_resistance"]
+    current = context.get("current_price") or context.get("stats", {}).get(
+        "current_price"
+    )
+    if not current:
+        # Fallback (має бути завжди)
+        current = (support + resistance) / 2
+
+    dist_to_support = (
+        abs(current - support) / current * 100 if support is not None else 100
+    )
+    dist_to_resistance = (
+        abs(current - resistance) / current * 100 if resistance is not None else 100
+    )
+
+    # Логіка визначення рекомендації на основі сценарію, впевненості і близькості до рівнів
+    if "RANGE_BOUND" in scenario:
+        if dist_to_support < 1.0:
+            return "BUY_IN_DIPS"
+        elif dist_to_resistance < 1.0:
+            return "SELL_ON_RALLIES"
+        elif min(dist_to_support, dist_to_resistance) > 1.5:
+            return "WAIT_FOR_CONFIRMATION"
+        else:
+            return "RANGE_TRADE"
 
     if composite > 0.8:
         if "BULLISH" in scenario:

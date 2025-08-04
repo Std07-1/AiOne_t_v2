@@ -111,6 +111,7 @@ def _analyze_market_context(
     )
 
     return {
+        "current_price": current,
         "scenario": scenario,
         "breakout_probability": breakout_prob,
         "pullback_probability": 1 - breakout_prob,
