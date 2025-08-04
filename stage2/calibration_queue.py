@@ -91,7 +91,7 @@ class CalibrationQueue:
     def set_state_manager(self, state_manager: Any) -> None:
         """Встановлює зовнішній state_manager для оновлення статусу калібрування."""
         self._state_manager = state_manager
-        log.info(f"StateManager set for CalibrationQueue: {id(state_manager)}")
+        # log.info(f"Використовується calib_queue id={id(state_manager)}")
 
     def __init__(
         self,
@@ -544,6 +544,12 @@ class CalibrationQueue:
                     symbol,
                     {"calib_status": "failed", "calib_error": str(e)},
                 )
+            # Запис результату з помилкою
+            result = {
+                "status": "error",
+                "error": str(e),
+                "calibration_time": time.time() - processing_start,
+            }
             raise
 
         oos = result.get("oos_validation", {})
@@ -619,8 +625,14 @@ class CalibrationQueue:
                 {
                     "calib_status": "completed",
                     "last_calib": datetime.utcnow().isoformat(),
-                    "calib_params": result,
+                    "calibrated_params": result,
                 },
+            )
+
+        # Оновлення параметрів у AssetMonitorStage1
+        if hasattr(self, "_state_manager") and self._state_manager:
+            self._state_manager.update_asset(
+                task.symbol, {"calibrated_params": result.get("recommended_params", {})}
             )
 
         # Запис метрик

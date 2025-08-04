@@ -40,7 +40,7 @@ from rich.logging import RichHandler
 
 # --- Логування ---
 logger = logging.getLogger("stage1_monitor")
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.DEBUG)
 logger.handlers.clear()
 logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False
@@ -60,6 +60,7 @@ class AssetMonitorStage1:
     def __init__(
         self,
         cache_handler: Any,
+        state_manager: Any = None,
         *,
         vol_z_threshold: float = 2.0,
         rsi_overbought: Optional[float] = None,
@@ -82,20 +83,57 @@ class AssetMonitorStage1:
         self.enable_stats = enable_stats
         self.asset_stats: Dict[str, Dict[str, Any]] = {}
         self._symbol_cfg: Dict[str, Thresholds] = {}
+        self.state_manager = state_manager
         # Статистики для anti-spam/визначення частоти тригерів можна додати тут, якщо потрібно
+
+    def update_params(
+        self,
+        vol_z_threshold: Optional[float] = None,
+        rsi_overbought: Optional[float] = None,
+        rsi_oversold: Optional[float] = None,
+    ) -> None:
+        """
+        Оновлює параметри монітора під час бектесту
+        """
+        if vol_z_threshold is not None:
+            self.vol_z_threshold = vol_z_threshold
+        if rsi_overbought is not None:
+            self.rsi_overbought = rsi_overbought
+        if rsi_oversold is not None:
+            self.rsi_oversold = rsi_oversold
+
+        logger.debug(
+            f"Оновлено параметри Stage1: vol_z={vol_z_threshold}, "
+            f"rsi_ob={rsi_overbought}, rsi_os={rsi_oversold}"
+        )
 
     async def ensure_symbol_cfg(self, symbol: str) -> Thresholds:
         """
         Завантажує індивідуальні пороги (з Redis або дефолтні).
+        Додає захист від ситуації, коли замість Thresholds приходить рядок (наприклад, symbol).
         """
+        import traceback
+
         if symbol not in self._symbol_cfg:
             thr = await load_thresholds(symbol, self.cache_handler)
+            # Захист: якщо thr — це рядок, а не Thresholds
+            if isinstance(thr, str):
+                logger.error(
+                    f"[{symbol}] load_thresholds повернув рядок замість Thresholds: {thr}"
+                )
+                logger.error(traceback.format_stack())
+                raise TypeError(
+                    f"[{symbol}] load_thresholds повернув рядок замість Thresholds: {thr}"
+                )
             if thr is None:
                 logger.warning(
                     f"[{symbol}] Не знайдено порогів у Redis, використовую стандартні"
                 )
-                thr = Thresholds()
+                thr = Thresholds(symbol=symbol, config={})
             self._symbol_cfg[symbol] = thr
+            logger.debug(
+                f"[{symbol}] Завантажено пороги: {getattr(thr, 'to_dict', lambda: thr)()}"
+            )
         return self._symbol_cfg[symbol]
 
     def set_global_levels(self, daily_data: Dict[str, pd.DataFrame]):
@@ -171,6 +209,14 @@ class AssetMonitorStage1:
 
         # 9. Глобальні денні рівні
         daily_levels = self.global_levels.get(symbol, [])
+        logger.debug(
+            f"[{symbol}] Глобальні рівні: {daily_levels} (кількість: {len(daily_levels)})"
+        )
+        if not daily_levels:
+            logger.warning(
+                f"[{symbol}] Глобальні рівні не знайдено, використовуйте Stage2 для розрахунку"
+            )
+            daily_levels = []
 
         # 10. Динамічні пороги RSI
         avg_rsi = rsi_s.mean()
@@ -219,7 +265,10 @@ class AssetMonitorStage1:
     ) -> Dict[str, Any]:
         """
         Аналізує основні тригери та формує raw signal.
+        Додає захист від ситуації, коли пороги некоректні (наприклад, рядок).
         """
+        import traceback
+
         # Завжди оновлюємо метрики по новому df
         stats = await self.update_statistics(symbol, df)
         price = stats["current_price"]
@@ -228,42 +277,98 @@ class AssetMonitorStage1:
         reasons: list[str] = []
 
         thr = await self.ensure_symbol_cfg(symbol)
+        # Захист: якщо thr — це рядок, а не Thresholds
+        if isinstance(thr, str):
+            logger.error(
+                f"[{symbol}] ensure_symbol_cfg повернув рядок замість Thresholds: {thr}"
+            )
+            logger.error(traceback.format_stack())
+            raise TypeError(
+                f"[{symbol}] ensure_symbol_cfg повернув рядок замість Thresholds: {thr}"
+            )
         logger.debug(
             f"[{symbol}] Пороги: low={thr.low_gate*100:.2f}%, high={thr.high_gate*100:.2f}%"
         )
 
-        atr_pct = stats["atr"] / price
-
-        # ————— Тихий ринок: повертаємо NORMAL без тригерів
-        if atr_pct < thr.low_gate:
+        # Отримання каліброваних параметрів
+        calibrated_params = None
+        if self.state_manager and symbol in self.state_manager.state:
+            asset_state = self.state_manager.state[symbol]
+            calibrated_params = asset_state.get("calibrated_params")
             logger.debug(
-                f"[{symbol}] ATR={atr_pct:.4f} < поріг low_gate — ринок спокійний."
+                f"[{symbol}] Отримано калібровані параметри: {calibrated_params}"
             )
-            return {
-                "symbol": symbol,
-                "current_price": price,
-                "signal": "NORMAL",
-                "anomalies": [],
-                "trigger_reasons": [],
-                "stats": stats,
-            }
 
-        # ————— Якщо ATR занадто низький — просто позначаємо low_atr, але не перериваємо логіку
-        low_atr_flag = False
-        if atr_pct < thr.low_gate:
-            logger.debug(
-                f"[{symbol}] ATR={atr_pct:.4f} < поріг low_gate — ринок тихий, але продовжуємо аналіз."
+        # Оновлення порогів
+        if calibrated_params:
+            thr.low_gate = calibrated_params.get("low_gate", thr.low_gate)
+            thr.high_gate = calibrated_params.get("high_gate", thr.high_gate)
+            thr.vol_z_threshold = calibrated_params.get(
+                "volume_z_threshold", thr.vol_z_threshold
             )
-            low_atr_flag = True
+            thr.rsi_oversold = calibrated_params.get("rsi_oversold", thr.rsi_oversold)
+            thr.rsi_overbought = calibrated_params.get(
+                "rsi_overbought", thr.rsi_overbought
+            )
+
+        logger.info(
+            f"[check_anomalies] {symbol} | Параметри застосовані: "
+            f"lg={thr.low_gate:.4f}, hg={thr.high_gate:.4f}, volz={thr.vol_z_threshold:.2f}, "
+            f"rsi_os={thr.rsi_oversold}, rsi_ob={thr.rsi_overbought}"
+        )
 
         def _add(reason: str, text: str) -> None:
             anomalies.append(text)
             reasons.append(reason)
 
+        # ————— Перевірка ATR —————
+        atr_pct = stats["atr"] / price
+
+        # Ініціалізація змінних
+        low_atr_flag = False  # Флаг для визначення, чи ринок спокійний
+
+        over = stats.get("dynamic_overbought", 70)
+        under = stats.get("dynamic_oversold", 30)
+
+        # ————— Якщо ATR занадто низький — просто позначаємо low_atr, але не перериваємо логіку
+        if atr_pct < thr.low_gate:
+            logger.debug(
+                f"[{symbol}] ATR={atr_pct:.4f} < поріг low_gate — ринок спокійний, але продовжуємо аналіз.."
+            )
+            low_atr_flag = True
+            _add("low_volatility", "📉 Низька волатильність")
+            # return {
+            #    "symbol": symbol,
+            #    "current_price": price,
+            #    "signal": "NORMAL",
+            #    "anomalies": [],
+            #    "trigger_reasons": [],
+            #    "stats": stats,
+            # }
+
+        # Додаткове логування для зневадження
+        logger.debug(
+            f"[{symbol}] Перевірка тригерів:"
+            f" price={price:.4f}"
+            f" - ATR={atr_pct:.4f} (поріг low={thr.low_gate:.4f}, high={thr.high_gate:.4f})"
+            f" - VolumeZ: {stats['volume_z']:.2f} (поріг {thr.vol_z_threshold:.2f})"
+            f" - RSI: {stats['rsi']:.2f} (OB {over:.2f}, OS {under:.2f})"
+            # f" - VWAP: {stats['vwap']:.4f} (поріг відхилення {thr.vwap_threshold:.2f})"
+        )
+
         # ————— ІНТЕГРАЦІЯ ВСІХ СУЧАСНИХ ТРИГЕРІВ —————
         # 1. Сплеск обсягу
         if volume_spike_trigger(df, z_thresh=thr.vol_z_threshold):
             _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
+            logger.debug(
+                f"[{symbol}] Volume spike detected: {stats['volume_z']:.2f} > {thr.vol_z_threshold:.2f}"
+            )
+
+        # if stats["volume_z"] > thr.vol_z_threshold:  # Використовувати оновлені stats
+        # _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
+        # logger.debug(
+        #    f"[{symbol}] Volume spike detected: {stats['volume_z']:.2f} > {thr.vol_z_threshold:.2f}"
+        # )
 
         # 2. Пробій рівнів (локальний breakout, підхід до рівня)
         breakout = breakout_level_trigger(
@@ -344,6 +449,8 @@ class AssetMonitorStage1:
             "signal": signal,
             "trigger_reasons": reasons,
             "stats": stats,
+            "calibrated_params": thr.to_dict(),
+            "thresholds": thr.to_dict(),
         }
 
 

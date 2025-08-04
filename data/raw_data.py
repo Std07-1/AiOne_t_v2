@@ -460,7 +460,8 @@ class OptimizedDataFetcher:
         interval: str,
         *,
         limit: int,
-        start_time: Optional[int] = None,
+        startTime: Optional[int] = None,
+        endTime: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Безпосередньо йде на /fapi/v1/klines.
@@ -480,8 +481,11 @@ class OptimizedDataFetcher:
             "interval": interval,
             "limit": limit,
         }
-        if start_time:
-            params["startTime"] = start_time
+        if startTime:
+            params["startTime"] = startTime
+        if endTime:
+            params["endTime"] = endTime
+        logger.debug("[FETCH] %s %s — запит %s", symbol, interval, params)
 
         async with GLOBAL_SEMAPHORE:
             text = await fetch_with_retry(
@@ -563,16 +567,16 @@ class OptimizedDataFetcher:
         symbol: str,
         interval: str,
         *,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
+        startTime: Optional[int] = None,
+        endTime: Optional[int] = None,
         limit: int = 1000,
     ) -> Optional[pd.DataFrame]:
         """Спеціалізований метод для калібрування з підтримкою часових діапазонів"""
         params = {"limit": limit}
-        if start_time:
-            params["startTime"] = start_time
-        if end_time:
-            params["endTime"] = end_time
+        if startTime:
+            params["startTime"] = startTime
+        if endTime:
+            params["endTime"] = endTime
 
         return await self._fetch_binance_data(symbol, interval, **params)
 

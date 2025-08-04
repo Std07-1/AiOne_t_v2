@@ -40,6 +40,7 @@ from stage2.calibration_queue import CalibrationQueue
 from app.screening_producer import AssetStateManager
 from stage2.config import STAGE2_CONFIG
 from stage2.calibration.calibration_config import CalibrationConfig
+from stage1.indicators.atr_indicator import ATRManager
 
 # Завантажуємо налаштування з .env
 load_dotenv()
@@ -392,6 +393,9 @@ async def run_pipeline() -> None:
     calibration_config = CalibrationConfig()  # Конфігурація калібрування
     stage2_config = STAGE2_CONFIG  # Конфігурація Stage2
 
+    # Ініціалізація ATRManager
+    atr_manager = ATRManager(period=stage2_config["atr_period"])
+
     # Підключення до Redis
     redis_conn = Redis(
         host=settings.redis_host,
@@ -418,7 +422,7 @@ async def run_pipeline() -> None:
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
         use_manual_list = (
-            False  # Змінити на False для автоматичного режиму, True - для ручного
+            True  # Змінити на False для автоматичного режиму, True - для ручного
         )
 
         if use_manual_list:
@@ -508,6 +512,7 @@ async def run_pipeline() -> None:
         main_logger.info("[Main] Ініціалізуємо AssetMonitorStage1...")
         monitor = AssetMonitorStage1(
             cache_handler=cache,
+            state_manager=state_manager,  # Додаємо state_manager для інтеграції
             vol_z_threshold=2.5,
             rsi_overbought=70,
             rsi_oversold=30,

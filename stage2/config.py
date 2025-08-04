@@ -61,19 +61,22 @@ STAGE2_CONFIG = {
         "stable": 0.2,  # Низький пріоритет для стейблкоїнів
         "default": 0.1,  # Для невизначених класів
     },
-    "rsi_period": 10,  # Період RSI
-    "volume_window": 30,  # Вікно обсягу для аналізу
-    "atr_period": 10,  # Період ATR
-    "volume_z_threshold": 1.2,  # сплеск обсягу ≥1.2σ (уніфіковано)
-    "rsi_oversold": 30.0,  # Рівень перепроданності RSI
-    "rsi_overbought": 70.0,  # Рівень перекупленості RSI
-    "stoch_oversold": 20.0,  # Рівень перепроданності стохастика
-    "stoch_overbought": 80.0,  # Рівень перекупленості стохастика
-    "macd_threshold": 0.02,  # Поріг MACD для сигналів
-    "ema_cross_threshold": 0.005,  # Поріг EMA перетину
-    "vwap_threshold": 0.001,  # 0.1% відхилення
-    "min_volume_usd": 10000,  # Мінімальний об'єм в USD
-    "min_atr_percent": 0.002,  # Мінімальний ATR у відсотках
+    "low_gate": 0.0015,  # Нижня межа ATR/price для «тихого» ринку (0.15%)
+    "high_gate": 0.0134,  # Верхня межа ATR/price для «високої» волатильності (1.34%)
+    "atr_target": [0.3, 1.5],  # Цільовий ATR у відсотках від ціни
+    "rsi_period": 10,  # Період RSI (10)
+    "volume_window": 30,  # Вікно обсягу для аналізу (30)
+    "atr_period": 10,  # Період ATR (10)
+    "volume_z_threshold": 1.2,  # сплеск обсягу ≥1.2σ (уніфіковано) (1.2)
+    "rsi_oversold": 23.0,  # Рівень перепроданності RSI (23%)
+    "rsi_overbought": 74.0,  # Рівень перекупленості RSI (74%)
+    "stoch_oversold": 20.0,  # Рівень перепроданності стохастика (20%)
+    "stoch_overbought": 80.0,  # Рівень перекупленості стохастика (80%)
+    "macd_threshold": 0.02,  # Поріг MACD для сигналів (0.02)
+    "ema_cross_threshold": 0.005,  # Поріг EMA перетину (0.005)
+    "vwap_threshold": 0.001,  # 0.1% відхилення (0.001)
+    "min_volume_usd": 10000,  # Мінімальний об'єм в USD (10000)
+    "min_atr_percent": 0.002,  # Мінімальний ATR у відсотках (0.002)
     "exclude_hours": [0, 1, 2, 3],  # Години, які виключаємо з аналізу
     "cooldown_period": 300,  # 5 хвилин охолодження між запитами
     "max_correlation_threshold": 0.85,  # Максимальний поріг кореляції
@@ -98,19 +101,52 @@ STAGE2_CONFIG = {
     "context_min_correlation": 0.7,  # Мінімальна кореляція для контексту
     "max_concurrent": 5,  # Максимум 5 паралельних калібрувань
     # залишаємо sr_window, tp_buffer_eps для SR/TP сумісності
-    "sr_window": 50,  # Вікно для SR розрахунків
-    "tp_buffer_eps": 0.0005,  # Буфер для TP розрахунків
+    "sr_window": 50,  # Вікно для SR розрахунків (50)
+    "tp_buffer_eps": 0.0005,  # Буфер для TP розрахунків (0.0005)
+    "metric_weights": {
+        "sharpe": 0.4,  # Вага Sharpe Ratio
+        "sortino": 0.3,  # Вага Sortino Ratio
+        "win_rate": 0.3,  # Вага Win Rate
+        "profit_factor": 0.3,  # Вага Profit Factor
+    },  # Ваги метрик для калібрування
+    "min_trades_for_calibration": 5,  # Мінімальна кількість угод для калібрування
+    "n_trials": 20,  # Кількість trial для Optuna
+    "run_calibration": True,  # Запускати калібрування
 }
 
 OPTUNA_PARAM_RANGES = {
-    "volume_z_threshold": (0.5, 3.0),
-    "rsi_oversold": (15.0, 40.0),
-    "rsi_overbought": (60.0, 85.0),
-    "tp_mult": (0.5, 5.0),
-    "sl_mult": (0.5, 5.0),
-    "min_confidence": (0.3, 0.9),
-    "min_score": (1.0, 2.5),
-    "min_atr_ratio": (0.0005, 0.01),
-    "volatility_ratio": (0.5, 1.2),
-    "fallback_confidence": (0.4, 0.7),
+    "volume_z_threshold": (0.5, 3.0),  # Поріг Z-score обсягу
+    "rsi_oversold": (15.0, 40.0),  # Рівень перепроданності RSI
+    "rsi_overbought": (60.0, 85.0),  # Рівень перекупленості RSI
+    "tp_mult": (0.5, 5.0),  # Множник для Take Profit
+    "sl_mult": (0.5, 5.0),  # Множник для Stop Loss
+    "min_confidence": (0.3, 0.9),  # Мінімальна впевненість сигналу
+    "min_score": (1.0, 2.5),  # Мінімальний скор для сигналу
+    "min_atr_ratio": (0.0005, 0.01),  # Мінімальний ATR у відсотках від ціни
+    "volatility_ratio": (0.5, 1.2),  # Відношення волатильності до ATR
+    "fallback_confidence": (0.4, 0.7),  # Впевненість для fallback сигналів
+    "atr_target": (0.3, 1.5),  # Цільовий ATR у відсотках від ціни
+    "low_gate": (0.002, 0.015),  # Нижня межа ATR/price для «тихого» ринку
+    "high_gate": (0.005, 0.03),  # Верхня межа ATR/price для «високої» волатильності
+}
+
+# Конфігурація NLP
+SCENARIO_MAP = {
+    "BULLISH_BREAKOUT": "{symbol} демонструє потенціал до бичого пробою",
+    "BEARISH_REVERSAL": "{symbol} показує ризики ведмежого розвороту",
+    "HIGH_VOLATILITY": "{symbol} у фазі підвищеної волатильності",
+    "BULLISH_CONTROL": "{symbol} під контролем покупців",
+    "BEARISH_CONTROL": "{symbol} під контролем продавців",
+    "RANGE_BOUND": "{symbol} торгується в боковому діапазоні",
+    "DEFAULT": "Невизначений сценарій для {symbol}",
+}
+
+TRIGGER_NAMES = {
+    "volume_spike": "сплеск обсягів",
+    "rsi_oversold": "перепроданість RSI",
+    "breakout_up": "пробій вгору",
+    "vwap_deviation": "відхилення від VWAP",
+    "ma_crossover": "перетин ковзних середніх",
+    "volume_divergence": "розбіжність обсягів",
+    "key_level_break": "пробиття ключового рівня",
 }

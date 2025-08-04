@@ -196,6 +196,8 @@ def objective(
         tp_mult = trial.suggest_float("tp_mult", 0.3, 5.0)
         sl_mult = trial.suggest_float("sl_mult", 0.1, 3.0)
         min_conf = trial.suggest_float("min_confidence", 0.3, 0.9)
+        low_gate = trial.suggest_float("low_gate", 0.001, 0.01)
+        high_gate = trial.suggest_float("high_gate", 0.01, 0.05)
         # Послаблення умови для RSI
         if rsi_low >= rsi_high - 10:  # Зменшити різницю до 10
             reason = f"Діапазон RSI замалий ({rsi_low} >= {rsi_high-10})"
@@ -209,6 +211,8 @@ def objective(
             "tp_mult": tp_mult,
             "sl_mult": sl_mult,
             "min_confidence": min_conf,
+            "low_gate": low_gate,
+            "high_gate": high_gate,
         }
         if base_config:
             params = {**base_config, **params}

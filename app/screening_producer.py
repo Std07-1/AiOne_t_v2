@@ -16,8 +16,9 @@ from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils_1_2 import _safe_float
 from stage2.calibration_queue import CalibrationQueue
-from stage2.market_analysis import stage2_consumer
+from stage2.processor import stage2_consumer
 from utils.utils_1_2 import ensure_timestamp_column
+from app.thresholds import save_thresholds, Thresholds
 
 
 # --- Налаштування логування ---
@@ -118,19 +119,23 @@ class AssetStateManager:
         ]
 
     async def update_calibration(self, symbol: str, params: Dict[str, Any]):
-        """Оновити калібровані параметри та статус, сигналізувати подію"""
+        # Генерація та збереження порогів
+        thr = Thresholds.from_mapping(params)
+        await save_thresholds(symbol, thr, self.cache)
+
+        # Оновлення стану
         if symbol in self.state:
             self.state[symbol].update(
-                {
-                    "calib_params": params,
-                    "calib_status": "completed",
-                    "last_calib": datetime.utcnow().isoformat(),
-                }
+                {"calibrated_params": params, "calib_status": "completed"}
             )
-            # Сигналізуємо про завершення калібрування
-            event = self.calibration_events.get(symbol)
-            if event:
-                event.set()
+
+        # Оновлення локального кешу
+        if symbol in self._symbol_cfg:
+            self._symbol_cfg[symbol] = thr
+
+        # Сигнал про завершення
+        if event := self.calibration_events.get(symbol):
+            event.set()
 
 
 def normalize_result_types(result: dict) -> dict:
@@ -150,9 +155,9 @@ def normalize_result_types(result: dict) -> dict:
         "btc_dependency_score",
     ]
 
-    if "calib_params" in result:
-        result["calib_params"] = {
-            k: float(v) for k, v in result["calib_params"].items()
+    if "calibrated_params" in result:
+        result["calibrated_params"] = {
+            k: float(v) for k, v in result["calibrated_params"].items()
         }
 
     for field in numeric_fields:
@@ -277,10 +282,27 @@ async def open_trades(
         symbol = signal["symbol"]
         confidence = _safe_float(signal.get("confidence", 0))
 
-        # Перевірка мінімальної впевненості
+        # Детальне логування причин, чому угода не відкривається
         if confidence < MIN_CONFIDENCE_TRADE:
+            logger.info(
+                f"⛔️ Не відкриваємо угоду для {symbol}: впевненість {confidence:.3f} < поріг {MIN_CONFIDENCE_TRADE}"
+            )
             logger.debug(
-                f"Пропуск торгівлі для {symbol}: низька впевненість ({confidence})"
+                f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
+            )
+            continue
+
+        # Додаткові перевірки (можна розширити)
+        if signal.get("signal", "NONE").upper() not in [
+            "ALERT",
+            "ALERT_BUY",
+            "ALERT_SELL",
+        ]:
+            logger.info(
+                f"⛔️ Не відкриваємо угоду для {symbol}: тип сигналу {signal.get('signal')} не є ALERT"
+            )
+            logger.debug(
+                f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
             )
             continue
 
@@ -311,7 +333,9 @@ async def open_trades(
 
             # Відкриття угоди
             await trade_manager.open_trade(trade_data)
-            logger.info(f"Відкрито угоду для {symbol} (впевненість: {confidence:.2f})")
+            logger.info(
+                f"✅ Відкрито угоду для {symbol} (впевненість: {confidence:.2f})"
+            )
         except Exception as e:
             logger.error(f"Помилка відкриття угоди для {symbol}: {str(e)}")
 
