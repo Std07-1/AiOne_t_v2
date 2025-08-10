@@ -53,14 +53,15 @@ logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False
 
 # ────────────────────────── Configuration ───────────────────────────
-DEFAULT_TTL = 60 * 60       # 1 hour
+DEFAULT_TTL = 60 * 60  # 1 hour
 MAX_RETRIES = 3
-BASE_DELAY = 0.4            # initial back-off seconds
-MAX_CONNECTIONS = 18        # safe pool size
+BASE_DELAY = 0.4  # initial back-off seconds
+MAX_CONNECTIONS = 18  # safe pool size
 HEALTH_CHECK_SEC = 30
 _REDIS_SEM = asyncio.Semaphore(MAX_CONNECTIONS - 2)  # limit concurrency
 CACHE_STATUS_VALID = "VALID"
 CACHE_STATUS_NODATA = "NO_DATA"
+
 
 # ╭──────────────────────── retry decorator ─────────────────────╮
 def with_retry(func):
@@ -88,7 +89,10 @@ def with_retry(func):
             except retriable as exc:
                 logger.warning(
                     "[Redis][RETRY %d/%d] %s → %s",
-                    attempt, MAX_RETRIES, func.__name__, exc,
+                    attempt,
+                    MAX_RETRIES,
+                    func.__name__,
+                    exc,
                 )
                 # drop busy connections
                 try:
@@ -99,8 +103,12 @@ def with_retry(func):
                     raise
                 await asyncio.sleep(delay + random.uniform(0, delay / 4))
                 delay *= 2
+
     return wrapper
+
+
 # ╰──────────────────────────────────────────────────────────────╯
+
 
 class SimpleCacheHandler:
     """
@@ -113,6 +121,7 @@ class SimpleCacheHandler:
     host : str | None, port : int | None, db : int
         Convenience for local Redis (ignored if redis_url provided).
     """
+
     FAST_SYMBOLS_KEY = "ai_one:fast_symbols"
 
     def __init__(
@@ -201,11 +210,12 @@ class SimpleCacheHandler:
             msg = (publish_message or symbol).encode()
             pipe.publish(publish_channel, msg)
         await pipe.execute()
-        logger.debug("[Redis][SET] %s %s(%ds) size=%dB",
-                     key,
-                     CACHE_STATUS_VALID,
-                     ttl,
-                     len(val),
+        logger.debug(
+            "[Redis][SET] %s %s(%ds) size=%dB",
+            key,
+            CACHE_STATUS_VALID,
+            ttl,
+            len(val),
         )
 
     @with_retry
@@ -328,21 +338,21 @@ class SimpleCacheHandler:
         await self.client.connection_pool.disconnect(inuse_connections=True)
         logger.debug("[Redis][CLOSE] Pool shut down.")
 
-
     async def set_fast_symbols(
-        self,
-        symbols: list[str],
-        *,
-        ttl: int = DEFAULT_TTL
+        self, symbols: list[str], *, ttl: int = DEFAULT_TTL
     ) -> None:
         """
         Записує список string-символів у Redis як JSON (унікальний ключ).
         """
-        if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        if not isinstance(symbols, list) or not all(
+            isinstance(s, str) for s in symbols
+        ):
             raise ValueError("set_fast_symbols: symbols має бути списком рядків!")
         val = json.dumps(symbols, ensure_ascii=False)
         await self.client.set(self.FAST_SYMBOLS_KEY, val, ex=ttl)
-        logger.debug("[Redis][SET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols)
+        logger.debug(
+            "[Redis][SET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols
+        )
 
     async def get_fast_symbols(self) -> list[str]:
         """
@@ -350,7 +360,9 @@ class SimpleCacheHandler:
         """
         val = await self.client.get(self.FAST_SYMBOLS_KEY)
         if not val:
-            logger.debug("[Redis][GET_FAST_SYMBOLS] Ключ %s відсутній!", self.FAST_SYMBOLS_KEY)
+            logger.debug(
+                "[Redis][GET_FAST_SYMBOLS] Ключ %s відсутній!", self.FAST_SYMBOLS_KEY
+            )
             return []
         try:
             symbols = json.loads(val.decode() if isinstance(val, bytes) else val)
@@ -358,7 +370,9 @@ class SimpleCacheHandler:
             logger.warning("[Redis][GET_FAST_SYMBOLS] decode error: %s", e)
             return []
         if isinstance(symbols, list) and all(isinstance(s, str) for s in symbols):
-            logger.debug("[Redis][GET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols)
+            logger.debug(
+                "[Redis][GET_FAST_SYMBOLS] %s → %s", self.FAST_SYMBOLS_KEY, symbols
+            )
             return symbols
         logger.warning("[Redis][GET_FAST_SYMBOLS] Unexpected type: %r", type(symbols))
         return []

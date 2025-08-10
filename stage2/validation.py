@@ -1,3 +1,9 @@
+# stage2.validation.py
+
+"""Модуль для валідації вхідних даних Stage2.
+Включає перевірки наявності ключів, реалістичності цін та діапазонів.
+"""
+
 import logging
 from rich.console import Console
 from rich.logging import RichHandler
@@ -13,7 +19,7 @@ logger.addHandler(handler)
 logger.propagate = False
 
 
-def _validate_input(stats: Dict[str, Any]):
+def validate_input(stats: Dict[str, Any]):
     """
     Валідація вхідних даних з додатковими перевірками.
     Args:
@@ -27,7 +33,7 @@ def _validate_input(stats: Dict[str, Any]):
         "atr",
         "daily_high",
         "daily_low",
-        "key_levels",
+        # "key_levels",
     ]
 
     for key in required_keys:
@@ -37,6 +43,9 @@ def _validate_input(stats: Dict[str, Any]):
         value = stats[key]
         if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             raise ValueError(f"Невірне значення для {key}: {value}")
+
+    if stats["atr"] <= 0:
+        raise ValueError("ATR має бути додатнім значенням")
 
     # Перевірка реалістичності ціни
     price = stats["current_price"]

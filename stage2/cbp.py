@@ -18,7 +18,7 @@ logger.addHandler(handler)
 logger.propagate = False
 
 
-def _calculate_breakout_probability(
+def calculate_breakout_probability(
     stats: Dict[str, Any], weights: Dict[str, float]
 ) -> float:
     """

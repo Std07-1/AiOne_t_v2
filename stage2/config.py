@@ -68,8 +68,8 @@ STAGE2_CONFIG = {
     "volume_window": 30,  # Вікно обсягу для аналізу (30)
     "atr_period": 10,  # Період ATR (10)
     "volume_z_threshold": 1.2,  # сплеск обсягу ≥1.2σ (уніфіковано) (1.2)
-    "rsi_oversold": 23.0,  # Рівень перепроданності RSI (23%)
-    "rsi_overbought": 74.0,  # Рівень перекупленості RSI (74%)
+    "rsi_oversold": 30.0,  # Рівень перепроданності RSI (30%)
+    "rsi_overbought": 70.0,  # Рівень перекупленості RSI (70%)
     "stoch_oversold": 20.0,  # Рівень перепроданності стохастика (20%)
     "stoch_overbought": 80.0,  # Рівень перекупленості стохастика (80%)
     "macd_threshold": 0.02,  # Поріг MACD для сигналів (0.02)
@@ -112,6 +112,36 @@ STAGE2_CONFIG = {
     "min_trades_for_calibration": 5,  # Мінімальна кількість угод для калібрування
     "n_trials": 20,  # Кількість trial для Optuna
     "run_calibration": True,  # Запускати калібрування
+    # Вимикачі
+    # за замовчуванням вмикаємо QDE та fallback-спадкоємність
+    "switches": {
+        # Головне:
+        "use_qde": True,  # QDE як основний аналіз
+        "legacy_fallback": False,  # використовувати стару логіку як fallback
+        "fallback_when": {  # коли падати у legacy
+            "qde_scenario_uncertain": True,  # якщо QDE => UNCERTAIN
+            "qde_conf_lt": 0.55,  # або якщо QDE confidence нижче порогу
+        },
+        # Вмикання/вимикання підсистем Stage2:
+        "analysis": {
+            "context": True,
+            "anomaly": True,
+            "confidence": True,
+            "risk": True,
+            "recommendation": True,
+            "narrative": True,
+        },
+        # Гранулярні вимикачі рівнів QDE:
+        "qde_levels": {"micro": True, "meso": True, "macro": True},
+        # Тригери Stage1 (перевіряються у AssetMonitorStage1):
+        "triggers": {
+            "volume_spike": True,
+            "breakout": True,
+            "volatility_spike": True,
+            "rsi": True,
+            "vwap_deviation": True,
+        },
+    },
 }
 
 OPTUNA_PARAM_RANGES = {
@@ -128,25 +158,4 @@ OPTUNA_PARAM_RANGES = {
     "atr_target": (0.3, 1.5),  # Цільовий ATR у відсотках від ціни
     "low_gate": (0.002, 0.015),  # Нижня межа ATR/price для «тихого» ринку
     "high_gate": (0.005, 0.03),  # Верхня межа ATR/price для «високої» волатильності
-}
-
-# Конфігурація NLP
-SCENARIO_MAP = {
-    "BULLISH_BREAKOUT": "{symbol} демонструє потенціал до бичого пробою",
-    "BEARISH_REVERSAL": "{symbol} показує ризики ведмежого розвороту",
-    "HIGH_VOLATILITY": "{symbol} у фазі підвищеної волатильності",
-    "BULLISH_CONTROL": "{symbol} під контролем покупців",
-    "BEARISH_CONTROL": "{symbol} під контролем продавців",
-    "RANGE_BOUND": "{symbol} торгується в боковому діапазоні",
-    "DEFAULT": "Невизначений сценарій для {symbol}",
-}
-
-TRIGGER_NAMES = {
-    "volume_spike": "сплеск обсягів",
-    "rsi_oversold": "перепроданість RSI",
-    "breakout_up": "пробій вгору",
-    "vwap_deviation": "відхилення від VWAP",
-    "ma_crossover": "перетин ковзних середніх",
-    "volume_divergence": "розбіжність обсягів",
-    "key_level_break": "пробиття ключового рівня",
 }

@@ -116,3 +116,58 @@ def format_price(price: float, symbol: str) -> str:
     else:
         # Для великих чисел використовуємо роздільник тисяч
         return f"{price:,.{decimals}f}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Тригери: стандартизація імен для Stage1 → Stage2/QDE/NLP
+# ──────────────────────────────────────────────────────────────────────────────
+TRIGGER_NAME_MAP: dict[str, str] = {
+    # volume / volatility
+    "volume_spike_trigger": "volume_spike",
+    "volume_spike": "volume_spike",
+    "volatility_spike_trigger": "volatility_burst",
+    "volatility_spike": "volatility_burst",
+    "volatility_burst": "volatility_burst",
+    # breakout / near levels
+    "breakout_level_trigger_up": "breakout_up",
+    "breakout_level_trigger_down": "breakout_down",
+    "breakout_up": "breakout_up",
+    "breakout_down": "breakout_down",
+    "near_high": "near_high",
+    "near_low": "near_low",
+    "near_daily_support": "near_daily_support",
+    "near_daily_resistance": "near_daily_resistance",
+    # rsi / дивергенції
+    "rsi_divergence_bearish": "bearish_div",
+    "rsi_divergence_bullish": "bullish_div",
+    "bearish_div": "bearish_div",
+    "bullish_div": "bullish_div",
+    "rsi_overbought": "rsi_overbought",
+    "rsi_oversold": "rsi_oversold",
+    # vwap / мікро-ліквідність
+    "vwap_deviation_trigger": "vwap_deviation",
+    "vwap_deviation": "vwap_deviation",
+    "liquidity_gap": "liquidity_gap",
+    "order_imbalance": "order_imbalance",
+}
+
+
+def normalize_trigger_reasons(reasons: list[str] | tuple[str, ...]) -> list[str]:
+    """
+    Приводить список причин-тригерів до єдиного стандарту.
+    - trim + lower
+    - мапінг на канонічні імена
+    - унікалізація зі збереженням порядку
+    """
+    if not reasons:
+        return []
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for raw in reasons:
+        key = str(raw).strip().lower()
+        std = TRIGGER_NAME_MAP.get(key, key)
+        if std and std not in seen:
+            normalized.append(std)
+            seen.add(std)
+    logger.debug(f"[normalize_trigger_reasons] in={reasons} → out={normalized}")
+    return normalized

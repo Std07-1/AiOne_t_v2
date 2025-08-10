@@ -32,8 +32,9 @@ from stage1.indicators import (
     vwap_deviation_trigger,
     ATRManager,
     VolumeZManager,
-    calculate_global_levels,
 )
+
+from stage1.utils import normalize_trigger_reasons
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -68,6 +69,7 @@ class AssetMonitorStage1:
         dynamic_rsi_multiplier: float = 1.1,
         min_reasons_for_alert: int = 2,
         enable_stats: bool = True,
+        feature_switches: dict | None = None,
     ):
         self.cache_handler = cache_handler
         self.vol_z_threshold = vol_z_threshold
@@ -85,6 +87,8 @@ class AssetMonitorStage1:
         self._symbol_cfg: Dict[str, Thresholds] = {}
         self.state_manager = state_manager
         # Статистики для anti-spam/визначення частоти тригерів можна додати тут, якщо потрібно
+        self.feature_switches = feature_switches or {}
+        self._sw_triggers = self.feature_switches.get("triggers") or {}
 
     def update_params(
         self,
@@ -135,16 +139,6 @@ class AssetMonitorStage1:
                 f"[{symbol}] Завантажено пороги: {getattr(thr, 'to_dict', lambda: thr)()}"
             )
         return self._symbol_cfg[symbol]
-
-    def set_global_levels(self, daily_data: Dict[str, pd.DataFrame]):
-        """
-        Приймає dict{symbol: daily_df} і для кожного розраховує глобальні рівні.
-        """
-        for sym, df in daily_data.items():
-            sym_l = sym.lower()
-            # Припустимо calculate_global_levels повертає List[float]
-            levels = calculate_global_levels(df, window=20)
-            self.global_levels[sym_l] = levels
 
     async def update_statistics(
         self,
@@ -207,17 +201,6 @@ class AssetMonitorStage1:
         volume = df["volume"].iloc[-1]
         volume_z = self.volumez_manager.update(symbol, volume)
 
-        # 9. Глобальні денні рівні
-        daily_levels = self.global_levels.get(symbol, [])
-        logger.debug(
-            f"[{symbol}] Глобальні рівні: {daily_levels} (кількість: {len(daily_levels)})"
-        )
-        if not daily_levels:
-            logger.warning(
-                f"[{symbol}] Глобальні рівні не знайдено, використовуйте Stage2 для розрахунку"
-            )
-            daily_levels = []
-
         # 10. Динамічні пороги RSI
         avg_rsi = rsi_s.mean()
 
@@ -246,7 +229,6 @@ class AssetMonitorStage1:
             "vwap": float(vwap) if vwap is not None else np.nan,
             "atr": float(atr) if atr is not None else np.nan,
             "volume_z": float(volume_z) if volume_z is not None else np.nan,
-            "key_levels": daily_levels,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             # Опціонально: можна додати median, quantile, trend, etc.
         }
@@ -262,6 +244,7 @@ class AssetMonitorStage1:
         symbol: str,
         df: pd.DataFrame,
         stats: Optional[Dict[str, Any]] = None,
+        trigger_reasons: List[str] = [],
     ) -> Dict[str, Any]:
         """
         Аналізує основні тригери та формує raw signal.
@@ -337,14 +320,6 @@ class AssetMonitorStage1:
             )
             low_atr_flag = True
             _add("low_volatility", "📉 Низька волатильність")
-            # return {
-            #    "symbol": symbol,
-            #    "current_price": price,
-            #    "signal": "NORMAL",
-            #    "anomalies": [],
-            #    "trigger_reasons": [],
-            #    "stats": stats,
-            # }
 
         # Додаткове логування для зневадження
         logger.debug(
@@ -358,11 +333,12 @@ class AssetMonitorStage1:
 
         # ————— ІНТЕГРАЦІЯ ВСІХ СУЧАСНИХ ТРИГЕРІВ —————
         # 1. Сплеск обсягу
-        if volume_spike_trigger(df, z_thresh=thr.vol_z_threshold):
-            _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
-            logger.debug(
-                f"[{symbol}] Volume spike detected: {stats['volume_z']:.2f} > {thr.vol_z_threshold:.2f}"
-            )
+        if self._sw_triggers.get("volume_spike", True):
+            if volume_spike_trigger(df, z_thresh=thr.vol_z_threshold):
+                _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
+                logger.debug(
+                    f"[{symbol}] Volume spike detected: {stats['volume_z']:.2f} > {thr.vol_z_threshold:.2f}"
+                )
 
         # if stats["volume_z"] > thr.vol_z_threshold:  # Використовувати оновлені stats
         # _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
@@ -371,61 +347,65 @@ class AssetMonitorStage1:
         # )
 
         # 2. Пробій рівнів (локальний breakout, підхід до рівня)
-        breakout = breakout_level_trigger(
-            df,
-            stats,
-            window=20,
-            near_threshold=0.005,
-            near_daily_threshold=0.5,  # наприклад, 0.5%
-            symbol=symbol,
-        )
-        if breakout["breakout_up"]:
-            _add("breakout_up", "🔺 Пробій вгору локального максимуму")
-        if breakout["breakout_down"]:
-            _add("breakout_down", "🔻 Пробій вниз локального мінімуму")
-        if breakout["near_high"]:
-            _add("near_high", "📈 Підхід до локального максимуму")
-        if breakout["near_low"]:
-            _add("near_low", "📉 Підхід до локального мінімуму")
-        if breakout["near_daily_support"]:
-            _add("near_daily_support", "🟢 Підхід до денного рівня підтримки")
-        if breakout["near_daily_resistance"]:
-            _add("near_daily_resistance", "🔴 Підхід до денного рівня опору")
+        if self._sw_triggers.get("breakout", True):
+            breakout = breakout_level_trigger(
+                df,
+                stats,
+                window=20,
+                near_threshold=0.005,
+                near_daily_threshold=0.5,  # наприклад, 0.5%
+                symbol=symbol,
+            )
+            if breakout["breakout_up"]:
+                _add("breakout_up", "🔺 Пробій вгору локального максимуму")
+            if breakout["breakout_down"]:
+                _add("breakout_down", "🔻 Пробій вниз локального мінімуму")
+            if breakout["near_high"]:
+                _add("near_high", "📈 Підхід до локального максимуму")
+            if breakout["near_low"]:
+                _add("near_low", "📉 Підхід до локального мінімуму")
+            if breakout["near_daily_support"]:
+                _add("near_daily_support", "🟢 Підхід до денного рівня підтримки")
+            if breakout["near_daily_resistance"]:
+                _add("near_daily_resistance", "🔴 Підхід до денного рівня опору")
 
         # 3. Сплеск волатильності
-        if volatility_spike_trigger(df, window=14, threshold=2.0):
-            _add("volatility_spike", "⚡️ Сплеск волатильності (ATR/TR)")
+        if self._sw_triggers.get("volatility_spike", True):
+            if volatility_spike_trigger(df, window=14, threshold=2.0):
+                _add("volatility_spike", "⚡️ Сплеск волатильності (ATR/TR)")
 
         # 4. RSI + дивергенції
-        rsi_res = rsi_divergence_trigger(df, rsi_period=14)
-        if rsi_res.get("rsi") is not None:
-            # Замість фіксованих 70/30 — динамічні з stats
-            over = stats["dynamic_overbought"]
-            under = stats["dynamic_oversold"]
-            if rsi_res["rsi"] > over:
-                _add(
-                    "rsi_overbought",
-                    f"🔺 RSI перекупленість ({rsi_res['rsi']:.1f} > {over:.1f})",
-                )
-            elif rsi_res["rsi"] < under:
-                _add(
-                    "rsi_oversold",
-                    f"🔻 RSI перепроданість ({rsi_res['rsi']:.1f} < {under:.1f})",
-                )
-            if rsi_res.get("bearish_divergence"):
-                _add("bearish_div", "🦀 Ведмежа дивергенція RSI/ціна")
-            if rsi_res.get("bullish_divergence"):
-                _add("bullish_div", "🦅 Бичача дивергенція RSI/ціна")
+        if self._sw_triggers.get("rsi", True):
+            rsi_res = rsi_divergence_trigger(df, rsi_period=14)
+            if rsi_res.get("rsi") is not None:
+                # Замість фіксованих 70/30 — динамічні з stats
+                over = stats["dynamic_overbought"]
+                under = stats["dynamic_oversold"]
+                if rsi_res["rsi"] > over:
+                    _add(
+                        "rsi_overbought",
+                        f"🔺 RSI перекупленість ({rsi_res['rsi']:.1f} > {over:.1f})",
+                    )
+                elif rsi_res["rsi"] < under:
+                    _add(
+                        "rsi_oversold",
+                        f"🔻 RSI перепроданість ({rsi_res['rsi']:.1f} < {under:.1f})",
+                    )
+                if rsi_res.get("bearish_divergence"):
+                    _add("bearish_div", "🦀 Ведмежа дивергенція RSI/ціна")
+                if rsi_res.get("bullish_divergence"):
+                    _add("bullish_div", "🦅 Бичача дивергенція RSI/ціна")
 
         # 5. Відхилення від VWAP
-        vwap_trig = vwap_deviation_trigger(
-            self.vwap_manager, symbol, price, threshold=0.005
-        )
-        if vwap_trig["trigger"]:
-            _add(
-                "vwap_deviation",
-                f"⚖️ Відхилення від VWAP на {vwap_trig['deviation']*100:.2f}%",
+        if self._sw_triggers.get("vwap_deviation", True):
+            vwap_trig = vwap_deviation_trigger(
+                self.vwap_manager, symbol, price, threshold=0.005
             )
+            if vwap_trig["trigger"]:
+                _add(
+                    "vwap_deviation",
+                    f"⚖️ Відхилення від VWAP на {vwap_trig['deviation']*100:.2f}%",
+                )
 
         # 6. Сплеск відкритого інтересу (OI)
         #    if open_interest_spike_trigger(df, z_thresh=3.0):
@@ -437,26 +417,32 @@ class AssetMonitorStage1:
         elif low_atr_flag:
             _add("low_atr", f"📉 ATR < {thr.low_gate:.2%}")
 
-        # Мінімум 2 причини — це "ALERT"
-        signal = "ALERT" if len(reasons) >= self.min_reasons_for_alert else "NORMAL"
+        # Зберігаємо причини тригерів для подальшої обробки
+        raw_reasons = list(reasons)  # зберігаємо «як є» для діагностики
 
-        logger.debug(f"[{symbol}] SIGNAL={signal}, тригери={reasons}, ціна={price:.4f}")
+        # Нормалізуємо причини тригерів
+        trigger_reasons = normalize_trigger_reasons(raw_reasons)
+
+        # Мінімум 2 причини — це "ALERT"
+        signal = (
+            "ALERT" if len(trigger_reasons) >= self.min_reasons_for_alert else "NORMAL"
+        )
+
+        logger.debug(
+            f"[{symbol}] SIGNAL={signal}, тригери={trigger_reasons}, ціна={price:.4f}"
+        )
 
         return {
             "symbol": symbol,
             "current_price": price,
             "anomalies": anomalies,
             "signal": signal,
-            "trigger_reasons": reasons,
+            "trigger_reasons": trigger_reasons,  # повертаємо канонічні імена
+            "raw_trigger_reasons": raw_reasons,  # опційно: залишимо для дебагу
             "stats": stats,
             "calibrated_params": thr.to_dict(),
             "thresholds": thr.to_dict(),
         }
-
-
-# Приклад використання:
-# monitor = AssetMonitorStage1(cache_handler)
-# signal = await monitor.check_anomalies("btcusdt", df)
 
 
 """

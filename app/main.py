@@ -41,6 +41,14 @@ from app.screening_producer import AssetStateManager
 from stage2.config import STAGE2_CONFIG
 from stage2.calibration.calibration_config import CalibrationConfig
 from stage1.indicators.atr_indicator import ATRManager
+from stage2.level_manager import LevelManager
+from stage1.indicators import calculate_global_levels
+from app.utils.helper import (
+    buffer_to_dataframe,
+    resample_5m,
+    estimate_atr_pct,
+    get_tick_size,
+)
 
 # Завантажуємо налаштування з .env
 load_dotenv()
@@ -392,6 +400,12 @@ async def run_pipeline() -> None:
     buffer = RAMBuffer(max_bars=120)  # RAMBuffer для зберігання історії
     calibration_config = CalibrationConfig()  # Конфігурація калібрування
     stage2_config = STAGE2_CONFIG  # Конфігурація Stage2
+    level_manager = LevelManager()  # Менеджер рівнів підтримки/опору
+    # Отримуємо налаштування користувача (з конфігураційного файлу)
+    user_settings = {
+        "lang": "UA",  # Мова за замовчуванням (може бути "UA" або "EN")
+        "style": "pro",  # Стиль за замовчуванням (може бути "pro", "explain", "short" )
+    }
 
     # Ініціалізація ATRManager
     atr_manager = ATRManager(period=stage2_config["atr_period"])
@@ -429,9 +443,9 @@ async def run_pipeline() -> None:
             # Ручний режим: використовуємо фіксований список
             fast_symbols = [
                 "btcusdt",
-                "ethusdt",
+                "OMNIUSDT",
                 "tonusdt",
-                "adausdt",
+                "PUMPUSDT",
             ]
             await cache.set_fast_symbols(fast_symbols, ttl=3600)  # TTL 1 година
             main_logger.info(
@@ -475,7 +489,28 @@ async def run_pipeline() -> None:
         await preload_1m_history(
             fetcher, fast_symbols, buffer, lookback=500
         )  # 500 барів (~8.3 години)
+
+        # Preload денних рівнів
         daily_data = await preload_daily_levels(fetcher, fast_symbols, days=30)
+        for sym, df in daily_data.items():
+            levels = calculate_global_levels(df, window=20)
+            level_manager.set_daily_levels(sym, levels)
+
+        # === LevelSystem v2: первинне наповнення з RAMBuffer (після preload) ===
+        for sym in fast_symbols:
+            df_1m = buffer_to_dataframe(buffer, sym, limit=500)
+            df_5m = resample_5m(df_1m)
+            df_1d = daily_data.get(sym)  # у тебе вже є daily_data (30 днів)
+            atr_pct = estimate_atr_pct(df_1m)
+            price_hint = (
+                float(df_1m["close"].iloc[-1])
+                if df_1m is not None and not df_1m.empty
+                else None
+            )
+            tick_size = get_tick_size(sym, price_hint=price_hint)
+
+            level_manager.update_meta(sym, atr_pct=atr_pct, tick_size=tick_size)
+            level_manager.update_from_bars(sym, df_1m=df_1m, df_5m=df_5m, df_1d=df_1d)
 
         # --- CalibrationEngine ---
         main_logger.info("[Main] Ініціалізуємо CalibrationEngine...")
@@ -517,9 +552,8 @@ async def run_pipeline() -> None:
             rsi_overbought=70,
             rsi_oversold=30,
             min_reasons_for_alert=2,
+            feature_switches=stage2_config.get("switches"),
         )
-        # Встановлюємо глобальні рівні підтримки/опору
-        monitor.set_global_levels(daily_data)
 
         # --- Виконуємо фон-воркери ---
         ws_task = asyncio.create_task(WSWorker(fast_symbols, buffer, cache).consume())
@@ -549,6 +583,10 @@ async def run_pipeline() -> None:
                 calib_queue=calib_queue,
                 # Додаємо state_manager для повної інтеграції (опціонально)
                 state_manager=state_manager,
+                level_manager=level_manager,  # Менеджер рівнів підтримки/опору
+                # Передаємо налаштування користувачаuser_lang=user_settings["lang"],
+                user_lang=user_settings["lang"],
+                user_style=user_settings["style"],
             )
         )
 

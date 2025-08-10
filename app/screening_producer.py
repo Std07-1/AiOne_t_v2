@@ -16,10 +16,16 @@ from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils_1_2 import _safe_float
 from stage2.calibration_queue import CalibrationQueue
-from stage2.processor import stage2_consumer
+from stage2.processor import Stage2Processor
 from utils.utils_1_2 import ensure_timestamp_column
 from app.thresholds import save_thresholds, Thresholds
-
+from stage2.level_manager import LevelManager
+from app.utils.helper import (
+    buffer_to_dataframe,
+    resample_5m,
+    estimate_atr_pct,
+    get_tick_size,
+)
 
 # --- Налаштування логування ---
 logger = logging.getLogger("app.screening_producer")
@@ -398,6 +404,86 @@ async def publish_full_state(
         logger.error(f"Помилка публікації стану: {str(e)}")
 
 
+async def process_single_stage2(
+    signal: Dict[str, Any],
+    processor: Stage2Processor,
+    state_manager: AssetStateManager,
+) -> None:
+    """Обробка одного сигналу Stage2 з оновленням стану"""
+    symbol = signal["symbol"]
+    try:
+        # Оновлюємо статус перед обробкою
+        state_manager.update_asset(symbol, {"stage2_status": "processing"})
+
+        # Безпосередня обробка через Stage2Processor
+        result = await processor.process(signal)
+
+        # Готуємо оновлення для стану активу
+        update = {
+            "stage2": True,
+            "stage2_status": "completed",
+            "last_updated": datetime.utcnow().isoformat(),
+        }
+
+        # Обробка результатів
+        if "error" in result:
+            update.update(
+                {
+                    "signal": "NONE",
+                    "hints": [f"Stage2 error: {result.get('error', 'unknown')}"],
+                }
+            )
+        else:
+            # Визначаємо сигнал на основі рекомендації
+            recommendation = result.get("recommendation", "")
+            if recommendation in ["STRONG_BUY", "BUY_IN_DIPS"]:
+                signal_type = "ALERT_BUY"
+            elif recommendation in ["STRONG_SELL", "SELL_ON_RALLIES"]:
+                signal_type = "ALERT_SELL"
+            else:
+                signal_type = "NORMAL"
+
+            # Оновлюємо метрики
+            confidence = result.get("confidence_metrics", {}).get(
+                "composite_confidence", 0.0
+            )
+            risk_params = result.get("risk_parameters", {})
+
+            update.update(
+                {
+                    "signal": signal_type,
+                    "confidence": confidence,
+                    "hints": [result.get("narrative", "")],
+                    "tp": risk_params.get("tp_targets", [None])[0],
+                    "sl": risk_params.get("sl_level"),
+                    "market_context": result.get("market_context"),
+                    "risk_parameters": risk_params,
+                    "confidence_metrics": result.get("confidence_metrics"),
+                    "anomaly_detection": result.get("anomaly_detection"),
+                    "narrative": result.get("narrative"),
+                    "recommendation": recommendation,
+                }
+            )
+
+        # Оновлюємо стан активу
+        state_manager.update_asset(symbol, update)
+
+    except Exception as e:
+        logger.error(f"Stage2 помилка для {symbol}: {str(e)}")
+        state_manager.update_asset(symbol, {"stage2_status": "error", "error": str(e)})
+
+
+async def process_single_stage2_with_semaphore(
+    signal: Dict[str, Any],
+    processor: Stage2Processor,
+    semaphore: asyncio.Semaphore,
+    state_manager: AssetStateManager,
+) -> None:
+    """Обробка сигналу Stage2 з обмеженням через семафор"""
+    async with semaphore:
+        await process_single_stage2(signal, processor, state_manager)
+
+
 async def screening_producer(
     monitor: AssetMonitorStage1,
     buffer: Any,
@@ -414,6 +500,10 @@ async def screening_producer(
     calib_engine: Optional[Any] = None,
     calib_queue: Optional[CalibrationQueue] = None,
     state_manager: AssetStateManager = None,
+    level_manager: LevelManager = None,
+    # Додаємо параметри налаштувань користувача
+    user_lang: str = "UA",
+    user_style: str = "explain",
 ) -> None:
     """
     Основний цикл генерації сигналів з централізованим станом:
@@ -445,6 +535,10 @@ async def screening_producer(
         f"глибина {lookback}, оновлення кожні {interval_sec} сек"
     )
 
+    # throttle для оновлення рівнів (раз на 20–30 сек)
+    _last_levels_update_ts = {}
+    LEVELS_UPDATE_EVERY = 25  # сек
+
     # Ініціалізація менеджера стану
     if state_manager is None:
         assets_current = [s.lower() for s in assets]
@@ -458,29 +552,18 @@ async def screening_producer(
     if calib_queue and hasattr(calib_queue, "set_state_manager"):
         calib_queue.set_state_manager(state_manager)
 
-    # Черги для нового Stage2Processor
-    stage2_input_queue = asyncio.Queue()
-    stage2_output_queue = asyncio.Queue()
-
-    # Запуск споживача Stage2
-    if calib_queue:
-        stage2_task = asyncio.create_task(
-            stage2_consumer(
-                input_queue=stage2_input_queue,
-                output_queue=stage2_output_queue,
-                calib_queue=calib_queue,
-                timeframe=timeframe,
-            )
-        )
-    if calib_queue:
-        logger.info(f"Використовується calib_queue id={id(calib_queue)}")
-    else:
-        logger.warning("Калібрування вимкнено, Stage2 не буде виконано")
-    logger.info(
-        "Калібрування Stage2 вимкнено"
-        if not calib_queue
-        else "Калібрування Stage2 увімкнено"
+    # Створюємо Stage2Processor (без черг)
+    processor = Stage2Processor(
+        calib_queue,
+        timeframe,
+        state_manager,
+        level_manager=level_manager,  # Передаємо LevelManager
+        user_lang=user_lang,  # Передаємо налаштування
+        user_style=user_style,
     )
+
+    # Семафор для обмеження паралельних задач Stage2
+    stage2_semaphore = asyncio.Semaphore(MAX_PARALLEL_STAGE2)
 
     # Публікація початкового стану
     await publish_full_state(state_manager, cache_handler, redis_conn)
@@ -541,6 +624,28 @@ async def screening_producer(
             continue
 
         logger.info(f"📊 Дані готові для {ready_count}/{len(assets_current)} активів")
+
+        # --- Оновлення LevelSystem v2 для активів, які зараз обробляємо ---
+        now_ts = int(time.time())
+        for symbol in ready_assets:
+            last_ts = _last_levels_update_ts.get(symbol, 0)
+            if (now_ts - last_ts) < LEVELS_UPDATE_EVERY:
+                continue
+
+            df_1m = buffer_to_dataframe(buffer, symbol, limit=500)
+            if df_1m is None or df_1m.empty:
+                continue
+            df_5m = resample_5m(df_1m)
+            atr_pct = estimate_atr_pct(df_1m)
+            price_hint = float(df_1m["close"].iloc[-1])
+            tick_size = get_tick_size(symbol, price_hint=price_hint)
+
+            level_manager.update_meta(symbol, atr_pct=atr_pct, tick_size=tick_size)
+            level_manager.update_from_bars(
+                symbol, df_1m=df_1m, df_5m=df_5m
+            )  # df_1d не обов'язковий щоразу
+
+            _last_levels_update_ts[symbol] = now_ts
 
         # Додавання завдань калібрування з детальним логуванням
         if calib_queue:
@@ -696,10 +801,9 @@ async def screening_producer(
         # Перевірка чи всі ALERT активи відкалібровані
         alert_signals = state_manager.get_alert_signals()
         if alert_signals and calib_queue:
-            logger.info(
-                f"[Stage2] Передача {len(alert_signals)} сигналів у Stage2Processor..."
-            )
+            logger.info(f"[Stage2] Обробка {len(alert_signals)} сигналів...")
 
+            # Перевірка калібрування
             not_calibrated = [
                 s
                 for s in alert_signals
@@ -708,16 +812,11 @@ async def screening_producer(
 
             if not_calibrated:
                 logger.warning(
-                    f"⏳ Очікування калібрування для {len(not_calibrated)} ALERT-активів..."
+                    f"⏳ Очікування калібрування для {len(not_calibrated)} активів..."
                 )
-                not_calibrated_symbols = [s["symbol"] for s in not_calibrated]
-                logger.info(
-                    f"Активи, що потребують калібрування: {not_calibrated_symbols}"
-                )
-
-                # Додаємо повторно у чергу всі невідкалібровані як термінові
-                for symbol in not_calibrated_symbols:
-                    logger.warning(f"Запит термінового калібрування для {symbol}")
+                # Запит термінового калібрування
+                for signal in not_calibrated:
+                    symbol = signal["symbol"]
                     try:
                         await calib_queue.put(
                             symbol=symbol, tf=timeframe, priority=0.1, is_urgent=True
@@ -726,120 +825,26 @@ async def screening_producer(
                             symbol, {"calib_status": "requeued_urgent"}
                         )
                     except Exception as e:
-                        logger.error(f"Помилка додавання {symbol} до черги: {e}")
+                        logger.error(f"Помилка запиту калібрування для {symbol}: {e}")
 
-                # Асинхронно чекаємо завершення калібрування для кожного символу з таймаутом
-                tasks = {
-                    symbol: asyncio.create_task(
-                        state_manager.wait_for_calibration(symbol, 120)
+                # Чекаємо 5 секунд на початок обробки (не блокуюче очікування)
+                await asyncio.sleep(5)
+                continue  # Переходимо до наступного циклу
+
+            # Обробка сигналів через Stage2Processor
+            tasks = []
+            for signal in alert_signals:
+                task = asyncio.create_task(
+                    process_single_stage2_with_semaphore(
+                        signal, processor, stage2_semaphore, state_manager
                     )
-                    for symbol in not_calibrated_symbols
-                }
-                # Поки є невідкалібровані — оновлюємо UI та чекаємо
-                while tasks:
-                    done, pending = await asyncio.wait(
-                        tasks.values(), timeout=1.0, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    await publish_full_state(state_manager, cache_handler, redis_conn)
-                    # Видаляємо завершені завдання
-                    for symbol in list(tasks.keys()):
-                        if tasks[symbol].done():
-                            del tasks[symbol]
+                )
+                tasks.append(task)
 
-                # Перевіряємо, чи всі активи відкалібровані
-                not_calibrated = [
-                    s
-                    for s in alert_signals
-                    if state_manager.state[s["symbol"]].get("calib_status")
-                    != "completed"
-                ]
-                if not_calibrated:
-                    logger.error(
-                        f"⏰ Не відкалібровано {len(not_calibrated)} активів: {[s['symbol'] for s in not_calibrated]}"
-                    )
-                    for s in not_calibrated:
-                        state_manager.update_asset(
-                            s["symbol"],
-                            {
-                                "calib_status": "timeout",
-                                "last_calib_attempt": datetime.utcnow().isoformat(),
-                            },
-                        )
-                # Виключаємо невідкалібровані з подальшої обробки
-                alert_signals = [
-                    s
-                    for s in alert_signals
-                    if state_manager.state[s["symbol"]].get("calib_status")
-                    == "completed"
-                ]
-
-            # Додаємо сигнали до черги обробки
-            await stage2_input_queue.put(alert_signals)
-
-            # Очікуємо результати обробки
-            stage2_results = await stage2_output_queue.get()
-            logger.info(
-                f"[Stage2] Отримано {len(stage2_results)} результатів з Stage2Processor"
-            )
-
-            # Оновлюємо стан активів на основі результатів Stage2
-            for result in stage2_results:
-                symbol = result.get("symbol")
-                if not symbol:
-                    continue
-
-                # Готуємо оновлення для стану активу
-                update = {
-                    "stage2": True,
-                    "stage2_status": "completed",
-                    "last_updated": datetime.utcnow().isoformat(),
-                }
-
-                # Обробка помилок
-                if "error" in result:
-                    update.update(
-                        {
-                            "signal": "NONE",
-                            "hints": [
-                                f"Stage2 error: {result.get('error', 'unknown')}"
-                            ],
-                        }
-                    )
-                else:
-                    # Визначаємо сигнал на основі рекомендації
-                    recommendation = result.get("recommendation", "")
-                    if recommendation in ["STRONG_BUY", "BUY_IN_DIPS"]:
-                        signal = "ALERT_BUY"
-                    elif recommendation in ["STRONG_SELL", "SELL_ON_RALLIES"]:
-                        signal = "ALERT_SELL"
-                    else:
-                        signal = "NORMAL"
-
-                    # Оновлюємо метрики
-                    confidence = result.get("confidence_metrics", {}).get(
-                        "composite_confidence", 0.0
-                    )
-                    risk_params = result.get("risk_parameters", {})
-
-                    update.update(
-                        {
-                            "signal": signal,
-                            "confidence": confidence,
-                            "hints": [result.get("narrative", "")],
-                            "tp": risk_params.get("tp_targets", [None])[0],
-                            "sl": risk_params.get("sl_level"),
-                            "market_context": result.get("market_context"),
-                            "risk_parameters": risk_params,
-                            "confidence_metrics": result.get("confidence_metrics"),
-                            "anomaly_detection": result.get("anomaly_detection"),
-                            "narrative": result.get("narrative"),
-                            "recommendation": recommendation,
-                        }
-                    )
-
-                state_manager.update_asset(symbol, update)
+            await asyncio.gather(*tasks)
+            logger.info(f"[Stage2] Завершено обробку {len(alert_signals)} сигналів")
         else:
-            logger.info("[Stage2] Немає сигналів ALERT для Stage2Processor")
+            logger.info("[Stage2] Немає сигналів ALERT для обробки")
 
         # Публікація стану активів
         logger.info("📢 Публікація стану активів...")

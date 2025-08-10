@@ -19,7 +19,7 @@ logger.addHandler(handler)
 logger.propagate = False
 
 
-def _detect_anomalies(
+def detect_anomalies(
     stats: Dict[str, Any],
     trigger_reasons: List[str],
     calibrated_params: Dict[str, Any],
