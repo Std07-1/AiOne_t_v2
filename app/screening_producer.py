@@ -41,19 +41,49 @@ MIN_READY_PCT = 0.1  # Мінімальний % активів з даними �
 MAX_PARALLEL_STAGE2 = 10  # Максимальна кількість паралельних задач Stage2
 MIN_CONFIDENCE_TRADE = 0.5  # Мінімальна впевненість для відкриття угоди
 TRADE_REFRESH_INTERVAL = 60  # Інтервал оновлення в секундах
+BUY_SET = {"STRONG_BUY", "BUY_IN_DIPS"}
+SELL_SET = {"STRONG_SELL", "SELL_ON_RALLIES"}
 
 # Глобальний семафор для обмеження паралельних задач Stage2
 STAGE2_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_STAGE2)
 
 
 class AssetStateManager:
-    """Централізований менеджер стану активів з підтримкою калібрування"""
+    """Централізований менеджер стану активів з підтримкою калібрування.
 
-    def __init__(self, initial_assets: List[str]):
-        self.state = {}
-        self.calibration_events = {}  # Для асинхронного очікування калібрування
+    Забезпечує:
+    - базовий стан активів,
+    - асинхронні події калібрування,
+    - інтеграцію з кешем/сховищем порогів та локальною мапою конфігів символів.
+
+    Args:
+        initial_assets: Початковий список символів.
+        cache_handler: Опціональний кеш/сховище для збереження порогів.
+        symbol_cfg: Опціональна мапа локальних конфігів порогів на символ.
+    """
+
+    def __init__(
+        self,
+        initial_assets: List[str],
+        cache_handler: Optional[Any] = None,
+        symbol_cfg: Optional[Dict[str, Any]] = None,
+    ):
+        self.state: Dict[str, Dict[str, Any]] = {}
+        self.calibration_events: Dict[str, asyncio.Event] = {}
+        self.cache: Optional[Any] = (
+            cache_handler  # може бути задано пізніше через сеттер
+        )
+        self._symbol_cfg: Dict[str, Any] = symbol_cfg or {}
         for asset in initial_assets:
             self.init_asset(asset)
+
+    def set_cache_handler(self, cache_handler: Any) -> None:
+        """Встановити обробник кешу/сховища порогів для збереження калібрування."""
+        self.cache = cache_handler
+
+    def set_symbol_config(self, symbol_cfg: Dict[str, Any]) -> None:
+        """Встановити локальну мапу конфігів порогів на символ (in-memory)."""
+        self._symbol_cfg = symbol_cfg or {}
 
     def init_asset(self, symbol: str):
         """Ініціалізація базового стану для активу"""
@@ -119,15 +149,31 @@ class AssetStateManager:
         return list(self.state.values())
 
     def get_alert_signals(self) -> List[Dict[str, Any]]:
-        """Отримати сигнали ALERT для Stage2 обробки"""
+        """Отримати сигнали ALERT* (ALERT/ALERT_BUY/ALERT_SELL) для Stage2."""
         return [
-            asset for asset in self.state.values() if asset.get("signal") == "ALERT"
+            asset
+            for asset in self.state.values()
+            if str(asset.get("signal", "")).upper().startswith("ALERT")
         ]
 
     async def update_calibration(self, symbol: str, params: Dict[str, Any]):
-        # Генерація та збереження порогів
+        """Оновити калібрування символу та зберегти пороги у кеш/сховищі.
+
+        Захищено від відсутності ``cache``/``_symbol_cfg``. Якщо кеш не задано,
+        збереження в сховищі пропускається з попередженням.
+        """
+        # Генерація та (опційне) збереження порогів
         thr = Thresholds.from_mapping(params)
-        await save_thresholds(symbol, thr, self.cache)
+        if getattr(self, "cache", None) is not None:
+            try:
+                await save_thresholds(symbol, thr, self.cache)
+            except Exception:
+                logger.exception("Помилка збереження порогів для %s", symbol)
+        else:
+            logger.warning(
+                "Cache handler не задано — пропускаємо збереження порогів для %s",
+                symbol,
+            )
 
         # Оновлення стану
         if symbol in self.state:
@@ -135,9 +181,13 @@ class AssetStateManager:
                 {"calibrated_params": params, "calib_status": "completed"}
             )
 
-        # Оновлення локального кешу
-        if symbol in self._symbol_cfg:
+        # Оновлення локальної мапи порогів (створимо/оновимо запис)
+        try:
+            if not hasattr(self, "_symbol_cfg") or self._symbol_cfg is None:
+                self._symbol_cfg = {}
             self._symbol_cfg[symbol] = thr
+        except Exception:
+            logger.debug("Не вдалося оновити локальну мапу порогів для %s", symbol)
 
         # Сигнал про завершення
         if event := self.calibration_events.get(symbol):
@@ -174,7 +224,7 @@ def normalize_result_types(result: dict) -> dict:
 
     # Визначення стану сигналу
     signal_type = result.get("signal", "NONE").upper()
-    if signal_type == "ALERT":
+    if signal_type == "ALERT" or signal_type.startswith("ALERT_"):
         result["state"] = "alert"
     elif signal_type == "NORMAL":
         result["state"] = "normal"
@@ -404,73 +454,142 @@ async def publish_full_state(
         logger.error(f"Помилка публікації стану: {str(e)}")
 
 
+def _map_reco_to_signal(recommendation: str) -> str:
+    """
+    Перетворює текстову рекомендацію Stage2 → тип сигналу продюсера.
+    """
+    if recommendation in BUY_SET:
+        return "ALERT_BUY"
+    if recommendation in SELL_SET:
+        return "ALERT_SELL"
+    return "NORMAL"
+
+
+def _first_not_none(seq: List[Optional[float]]) -> Optional[float]:
+    for x in seq or []:
+        if x is not None:
+            return x
+    return None
+
+
 async def process_single_stage2(
     signal: Dict[str, Any],
-    processor: Stage2Processor,
-    state_manager: AssetStateManager,
+    processor: "Stage2Processor",
+    state_manager: "AssetStateManager",
 ) -> None:
-    """Обробка одного сигналу Stage2 з оновленням стану"""
+    """
+    Обробляє один Stage2-сигнал і оновлює стан активу.
+
+    Враховано:
+    - фільтрація порожнього наративу (не кладемо "" у hints)
+    - явне fallback-поведінка для UNCERTAIN (recommendation → WAIT/NORMAL)
+    - акуратне складання update без None-перезаписів ключових полів
+    - мепінг recommendation → signal_type
+    - логування з прев’ю наративу
+    """
     symbol = signal["symbol"]
     try:
-        # Оновлюємо статус перед обробкою
         state_manager.update_asset(symbol, {"stage2_status": "processing"})
 
-        # Безпосередня обробка через Stage2Processor
-        result = await processor.process(signal)
+        # Обробка Stage2 (всередині вже: CONFIDENCE → RECO → RISK → NARRATIVE)
+        result: Dict[str, Any] = await processor.process(signal)
 
-        # Готуємо оновлення для стану активу
-        update = {
+        # Базове оновлення
+        update: Dict[str, Any] = {
             "stage2": True,
             "stage2_status": "completed",
             "last_updated": datetime.utcnow().isoformat(),
         }
 
-        # Обробка результатів
+        # Помилка Stage2 — зафіксували та вийшли
         if "error" in result:
+            err_text = str(result.get("error", "unknown"))
             update.update(
                 {
                     "signal": "NONE",
-                    "hints": [f"Stage2 error: {result.get('error', 'unknown')}"],
+                    "hints": [f"Stage2 error: {err_text}"],
                 }
             )
-        else:
-            # Визначаємо сигнал на основі рекомендації
-            recommendation = result.get("recommendation", "")
-            if recommendation in ["STRONG_BUY", "BUY_IN_DIPS"]:
-                signal_type = "ALERT_BUY"
-            elif recommendation in ["STRONG_SELL", "SELL_ON_RALLIES"]:
-                signal_type = "ALERT_SELL"
-            else:
-                signal_type = "NORMAL"
+            state_manager.update_asset(symbol, update)
+            return
 
-            # Оновлюємо метрики
-            confidence = result.get("confidence_metrics", {}).get(
-                "composite_confidence", 0.0
-            )
-            risk_params = result.get("risk_parameters", {})
+        # --------- Дістаємо ключові частини результату без падінь ---------
+        market_ctx = result.get("market_context", {}) or {}
+        scenario = market_ctx.get("scenario") or "UNCERTAIN"
 
-            update.update(
-                {
-                    "signal": signal_type,
-                    "confidence": confidence,
-                    "hints": [result.get("narrative", "")],
-                    "tp": risk_params.get("tp_targets", [None])[0],
-                    "sl": risk_params.get("sl_level"),
-                    "market_context": result.get("market_context"),
-                    "risk_parameters": risk_params,
-                    "confidence_metrics": result.get("confidence_metrics"),
-                    "anomaly_detection": result.get("anomaly_detection"),
-                    "narrative": result.get("narrative"),
-                    "recommendation": recommendation,
-                }
-            )
+        # Якщо сценарій невизначений — за замовчуванням безпечна рекомендація.
+        recommendation = result.get("recommendation")
+        if not recommendation and scenario == "UNCERTAIN":
+            recommendation = "WAIT"
 
-        # Оновлюємо стан активу
+        # Тип сигналу
+        signal_type = _map_reco_to_signal(recommendation or "")
+
+        # Ризики
+        risk_params = result.get("risk_parameters", {}) or {}
+        tp0 = _first_not_none(risk_params.get("tp_targets"))
+        sl = risk_params.get("sl_level")
+
+        # Впевненість
+        conf = result.get("confidence_metrics", {}) or {}
+        composite_conf = conf.get("composite_confidence", 0.0)
+
+        # Наратив → у hints тільки якщо непорожній
+        raw_narr = (result.get("narrative") or "").strip()
+        hints: List[str] = []
+        if raw_narr:
+            hints.append(raw_narr)
+            try:
+                logger.info("[NARR] %s %s", symbol, raw_narr.replace("\n", " "))
+            except Exception:
+                logger.debug("[NARR] %s (logging failed)", symbol)
+
+        # Додаткові поля, якщо вони є у результаті (не обов’язкові)
+        anomaly_det = result.get("anomaly_detection")
+        trigger_reasons = result.get("trigger_reasons") or market_ctx.get(
+            "trigger_reasons"
+        )
+        calibrated_params = result.get("calibrated_params")
+        qde_info = result.get("qde")  # якщо ти повертаєш внутрішні ваги/матрицю з QDE
+
+        # --------- Формуємо update. Не записуємо None де це шкідливо ---------
+        update["signal"] = signal_type
+        update["confidence"] = composite_conf
+        if hints:
+            # тільки якщо є текст
+            update["hints"] = list(
+                dict.fromkeys(hints)
+            )  # видалити дублікати з збереженням порядку
+        if tp0 is not None:
+            update["tp"] = tp0
+        if sl is not None:
+            update["sl"] = sl
+
+        update["market_context"] = market_ctx or None
+        update["risk_parameters"] = risk_params or None
+        update["confidence_metrics"] = conf or None
+        update["anomaly_detection"] = anomaly_det or None
+        update["trigger_reasons"] = trigger_reasons or None
+        update["narrative"] = raw_narr or None
+        update["recommendation"] = recommendation or None
+        update["scenario"] = scenario
+        if calibrated_params is not None:
+            update["calibrated_params"] = calibrated_params
+        if qde_info is not None:
+            update["qde"] = qde_info
+
         state_manager.update_asset(symbol, update)
 
-    except Exception as e:
-        logger.error(f"Stage2 помилка для {symbol}: {str(e)}")
-        state_manager.update_asset(symbol, {"stage2_status": "error", "error": str(e)})
+    except Exception:
+        # Повний стек у логах, стан — error
+        logger.exception("Stage2 помилка для %s", symbol)
+        state_manager.update_asset(
+            symbol,
+            {
+                "stage2_status": "error",
+                "error": "Stage2 exception (див. логи)",
+            },
+        )
 
 
 async def process_single_stage2_with_semaphore(
@@ -671,7 +790,7 @@ async def screening_producer(
                     continue
 
                 # Класифікація завдань
-                if asset_state.get("signal") == "ALERT":
+                if str(asset_state.get("signal", "")).upper().startswith("ALERT"):
                     urgent_calib_tasks.append(symbol)
                 elif asset_state.get("volume_usd", 0) > 5_000_000:
                     high_priority_tasks.append(symbol)
@@ -753,7 +872,11 @@ async def screening_producer(
                 if calib_queue:
                     for symbol in batch:
                         asset_state = state_manager.state.get(symbol, {})
-                        if asset_state.get("signal") == "ALERT":
+                        if (
+                            str(asset_state.get("signal", ""))
+                            .upper()
+                            .startswith("ALERT")
+                        ):
                             # Перевірка чи потрібне калібрування
                             if asset_state.get("calib_status") not in [
                                 "completed",
